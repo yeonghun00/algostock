@@ -7,7 +7,7 @@ Public API:
     FEATURE_COLUMNS  — list of all registered feature column names
 """
 
-from ml.features.registry import FeatureGroup, register, get_all_feature_columns, get_all_groups
+from ml.features.registry import FeatureGroup, register, get_all_feature_columns, get_all_groups, get_feature_group_map
 
 # Import all feature groups to trigger @register decorators.
 # The import order does NOT matter — the registry's resolve_order()
@@ -23,6 +23,7 @@ from ml.features import (  # noqa: F401
     sector_neutral,
     distress,
     sector_rotation,
+    macro_interaction,
 )
 
 from ml.features._pipeline import FeatureEngineer

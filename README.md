@@ -1,203 +1,219 @@
 # AlgoStock
 
-<p align="center">
-  <b>Korean Stock Market Data Collection, Screening & Backtesting System</b>
-</p>
+Korean equity quantitative trading system — KRX data pipeline, LightGBM ranking model, walk-forward backtest, and automated live rebalancing via Kiwoom REST API.
 
-<p align="center">
-  <img src="https://img.shields.io/badge/python-3.8+-blue.svg" alt="Python 3.8+">
-  <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
-  <img src="https://img.shields.io/badge/market-KOSPI%20%7C%20KOSDAQ%20%7C%20KODEX-orange.svg" alt="Markets">
-</p>
+**Backtest results (2018–2025, out-of-sample)**
+- Total return: 195.9% vs KOSPI 200 benchmark 153.2% (+42.7% alpha)
+- Sharpe: 0.96 | Calmar: 0.82 | Max drawdown: -17.8% | Ann. return: 14.5%
+- IC: 0.1268 | IC IR: 1.76 | Down capture: 0.07 | Beta: 0.38
+- Statistical significance: 4/4 t-tests pass at 1% (Newey-West, Bootstrap CI [0.36, 1.83])
 
 ---
 
-A comprehensive system for automated collection, screening, and backtesting of Korean stock market data from KRX (Korea Exchange).
+## How to Use
 
-## Features
-
-| Feature | Description |
-|---------|-------------|
-| **Data Collection** | Automated ETL pipeline with KRX API integration |
-| **Stock Screening** | Find top performers by price increase, trading value, or combined metrics |
-| **Backtesting** | Test screening strategies with customizable parameters |
-| **Historical Data** | 15+ years of data (2011-present) for KOSPI, KOSDAQ, KODEX |
-
-## Quick Start
+### 1. Update data
 
 ```bash
-# Clone
-git clone https://github.com/yourusername/algostock.git
-cd algostock
-
-# Install
-pip install -r requirements.txt
-
-# Configure
-cp config.example.json config.json
-# Edit config.json with your KRX API key
-
-# Check status
-python3 scripts/algostock_cli.py etl status
+python3 scripts/run_etl.py update --markets kospi,kosdaq --workers 4
 ```
 
-## Getting KRX API Key
-
-1. Visit [KRX Open API](https://data.krx.co.kr/)
-2. Create an account and apply for API access
-3. Copy your API key to `config.json`
-
-## Usage
-
-### ETL (Extract-Transform-Load)
+Or via the unified CLI:
 
 ```bash
-# Database status
-python3 scripts/algostock_cli.py etl status
-
-# Daily update
-python3 scripts/algostock_cli.py etl update
-
-# Auto catch-up (fills any gaps)
-python3 scripts/algostock_cli.py etl update --catchup
-
-# Historical backfill
-python3 scripts/algostock_cli.py etl backfill -s 20200101 -e 20201231
-
-# Verify data completeness
-python3 scripts/algostock_cli.py etl verify
-
-# Auto-fix missing data
-python3 scripts/algostock_cli.py etl verify --fix
+python3 scripts/algostock_cli.py update-all
 ```
 
-### Stock Screening
+### 2. Run a backtest
 
 ```bash
-# Top 5% by price increase
-python3 scripts/algostock_cli.py analyze price -s 20240101 -e 20241231 -p 5
-
-# Top 5% by trading value
-python3 scripts/algostock_cli.py analyze value -s 20240101 -e 20241231 -p 5
-
-# Combined: top 5% in BOTH price AND value
-python3 scripts/algostock_cli.py analyze combined -s 20240101 -e 20241231 -pp 5 -vp 5
-
-# Filter by market (kospi, kosdaq, kodex)
-python3 scripts/algostock_cli.py analyze combined -s 20240101 -e 20241231 -m kospi,kosdaq
+python3 scripts/run_backtest.py \
+  --start 20100101 --end 20260101 \
+  --horizon 42 --top-n 20 \
+  --train-years 3 --min-market-cap 100000000000 --max-market-cap 1000000000000 \
+  --buy-rank 10 --hold-rank 120 \
+  --buy-fee 0.05 --sell-fee 0.25 \
+  --patience 100 --no-cache \
+  --output myrun --save-picks
 ```
 
-### Backtesting
+Results saved to `runs/myrun/`. Includes `results.csv`, `picks.csv`, `model.pkl`, `report.png`.
+
+### 3. Get today's picks (manual)
 
 ```bash
-# Basic: yearly screening, 1-year hold
-python3 scripts/algostock_cli.py backtest -s 20200101 -e 20241231
-
-# Custom strategy
-python3 scripts/algostock_cli.py backtest -s 20200101 -e 20241231 \
-    --n-stocks 10 \
-    --holding-months 6 \
-    --rebalance-months 6 \
-    --weighting mcap \
-    --sort-by combined
+python3 scripts/get_picks.py --model-path runs/myrun/model.pkl --top 20
 ```
 
-#### Backtest Options
+### 4. Live rebalancing — check schedule
 
-| Option | Values | Description |
-|--------|--------|-------------|
-| `--n-stocks` | 1-100 | Number of stocks per period |
-| `--holding-months` | 1-60 | How long to hold positions |
-| `--rebalance-months` | 1-60 | How often to rebalance |
-| `--weighting` | `equal`, `value`, `inverse_value`, `mcap`, `inverse_mcap` | Portfolio weighting method |
-| `--sort-by` | `price`, `value`, `combined` | Stock selection criteria |
+```bash
+# Dry-run: update DB, check if today is rebalance day, show plan
+python3 scripts/run_live.py --run myrun
+```
+
+Shows one of:
+- `⏳ N 거래일 후 실행일` — not yet, nothing to do
+- `📅 내일이 실행일` — tomorrow, previews picks
+- `✅ 오늘이 실행일` — today, shows buy/sell orders
+
+### 5. Live rebalancing — execute orders
+
+```bash
+python3 scripts/run_live.py --run myrun --execute
+```
+
+Requires Kiwoom API credentials in `.env` (see below).
+
+---
+
+## Automated Scheduling
+
+### Start (runs daily at 07:30 local time, auto-selects latest run)
+
+```bash
+./scripts/setup_scheduler.sh start
+```
+
+### Start with specific run and time
+
+```bash
+./scripts/setup_scheduler.sh start --run myrun --hour 7 --min 30
+```
+
+### Stop everything
+
+```bash
+./scripts/setup_scheduler.sh stop
+sudo pmset repeat cancel    # if you set the wake schedule
+```
+
+### Check status
+
+```bash
+./scripts/setup_scheduler.sh status
+```
+
+### Wake Mac from sleep before scheduled time (optional)
+
+```bash
+# Wake 5 min before — e.g. for 07:30 schedule:
+sudo pmset repeat wakeorpoweron MTWRF 07:25:00
+```
+
+> **Timezone note (HKT = UTC+8):** Korean market opens 9:00 AM KST = 8:00 AM HKT.
+> Run before 8:00 AM HKT to place opening orders. Running after 8:00 AM HKT means market is closed and Kiwoom will reject orders.
+
+---
+
+## Kiwoom API Setup
+
+Create `.env` in the project root (already in `.gitignore`):
+
+```
+KIWOOM_APP_KEY=your_app_key
+KIWOOM_APP_SECRET=your_app_secret
+KIWOOM_ACCOUNT=12345678-01
+KIWOOM_MOCK=true       # true = paper trading, false = real money
+```
+
+---
+
+## DB Validation
+
+```bash
+sqlite3 krx_stock_data.db "SELECT MAX(date) FROM daily_prices;"
+sqlite3 krx_stock_data.db "SELECT MAX(date) FROM index_constituents;"
+sqlite3 krx_stock_data.db "SELECT COUNT(*) FROM financial_periods;"
+```
+
+---
+
+## Verify Backtest Results Independently
+
+```bash
+python3 verification/verify_backtest.py --run myrun --tolerance 0.05
+```
+
+Cross-checks picks against Naver Finance adjusted prices. See `verification/README.md`.
+
+---
 
 ## Project Structure
 
 ```
 algostock/
-├── config.py                # Configuration loader
-├── config.example.json      # Example config template
-├── scripts/                 # Runnable entry points
-│   ├── algostock_cli.py     # Unified CLI interface
-│   ├── run_backtest.py      # ML backtest runner
-│   ├── get_picks.py         # Daily stock picks
-│   ├── run_safety_check.py  # Model safety checks
-│   ├── run_index_etl.py     # Index data ETL runner
-│   └── build_benchmark.py   # Benchmark builder
-├── etl/                     # Data pipeline
-│   ├── krx_api.py           # KRX API client
-│   ├── clean_etl.py         # Main ETL pipeline
-│   ├── financial_etl.py     # Financial statement loader
-│   └── index_etl.py         # Market index ETL
-├── ml/                      # ML pipeline
-│   ├── features.py          # Feature engineering
-│   ├── model.py             # LightGBM ranker
-│   ├── macro_features.py    # Macro regime detection
-│   └── backtest.py          # ML backtester
-├── features/                # Financial features
-│   └── financial_features.py
-├── analyzer/                # Screening & backtesting
-│   ├── screeners.py         # Stock screening engine
-│   └── backtester.py        # Backtesting engine
-├── models/                  # Saved ML models
-├── data/                    # Data files
-│   └── raw_financial/       # Raw financial statement zips
-├── docs/                    # Documentation
-└── requirements.txt
+├── etl/                          # Data ingestion pipelines
+│   ├── krx_api.py                # KRX API client (rate-limited, parallel)
+│   ├── clean_etl.py              # Prices + stock master
+│   ├── index_constituents_etl.py # Index membership snapshots
+│   ├── delisted_stocks_etl.py    # Delisted stock list
+│   ├── adj_price_etl.py          # Adjusted price chain builder
+│   └── financial_etl.py          # Financial statements (BS/PL/CF)
+├── ml/
+│   ├── features/                 # Feature engineering (registry pattern)
+│   │   ├── registry.py           # @register decorator + topological sort
+│   │   ├── _pipeline.py          # Data loading, merging, orchestration
+│   │   ├── momentum.py           # Price momentum features
+│   │   ├── momentum_academic.py  # 52w proximity, MA ratios
+│   │   ├── volume.py             # Amihud illiquidity, turnover
+│   │   ├── volatility.py         # Rolling vol, beta
+│   │   ├── fundamental.py        # ROE, GPA (PIT-safe)
+│   │   ├── market.py             # Market regime, index count
+│   │   ├── sector.py             # Sector momentum, breadth
+│   │   ├── sector_neutral.py     # Sector z-scores
+│   │   ├── sector_rotation.py    # Dispersion, rotation signal
+│   │   ├── distress.py           # Liquidity decay, low-price trap
+│   │   └── macro_interaction.py  # Value/momentum regime interactions
+│   └── models/                   # Model backends
+│       ├── base.py               # BaseRanker (save/load/predict)
+│       ├── lgbm.py               # LightGBM (default)
+│       ├── xgboost.py            # XGBoost
+│       └── catboost.py           # CatBoost
+├── scripts/                      # Entry points
+│   ├── run_backtest.py           # Walk-forward backtest + model training
+│   ├── get_picks.py              # Generate picks from trained model
+│   ├── run_live.py               # Live rebalancing + Kiwoom orders
+│   ├── run_etl.py                # Unified ETL runner
+│   ├── algostock_cli.py          # CLI (etl status/update/backfill)
+│   ├── dashboard.py              # HTML dashboard generator
+│   ├── auto_live.sh              # Daily automation wrapper
+│   └── setup_scheduler.sh        # Install/remove launchd scheduler
+├── verification/
+│   ├── verify_backtest.py        # Independent result verification
+│   └── README.md
+├── runs/                         # Backtest outputs (per run)
+│   └── <run_name>/
+│       ├── results.csv           # Per-rebalance returns + alpha
+│       ├── picks.csv             # All stock picks with scores
+│       ├── model.pkl             # Trained model artifact
+│       ├── report.png            # Visual report
+│       └── ...
+├── live/                         # Live trading state
+│   ├── state.json                # Current holdings + last rebal date
+│   └── logs/                     # Daily run logs (YYYYMMDD.log)
+├── docs/                         # Reference documentation
+│   ├── OVERVIEW.md               # Architecture + end-to-end workflow
+│   ├── ETL.md                    # ETL pipeline details + DB schema
+│   ├── MODEL.md                  # Features, model params, CLI reference
+│   └── BIAS.md                   # Bias reduction mechanisms
+└── krx_stock_data.db             # SQLite database (all market data)
 ```
 
-## Database
+---
 
-SQLite database with ~8M+ records:
+## Docs
 
-| Table | Description |
-|-------|-------------|
-| `stocks` | Stock metadata (code, name, market) |
-| `daily_prices` | Daily OHLCV data with optimized indexes |
+| Doc | Contents |
+|---|---|
+| [docs/OVERVIEW.md](docs/OVERVIEW.md) | Architecture, end-to-end workflow |
+| [docs/ETL.md](docs/ETL.md) | ETL pipelines, DB schema, backfill commands |
+| [docs/MODEL.md](docs/MODEL.md) | Features (87 total), model params, CLI flags |
+| [docs/BIAS.md](docs/BIAS.md) | Look-ahead bias, PIT safety, survivorship controls |
+| [verification/README.md](verification/README.md) | Independent backtest verification tool |
 
-## Configuration
-
-Key settings in `config.json`:
-
-```json
-{
-  "api": {
-    "auth_key": "YOUR_KRX_API_KEY",
-    "request_delay": 1.0,
-    "max_concurrent_requests": 3
-  },
-  "backfill": {
-    "start_year": 2011
-  }
-}
-```
-
-## Requirements
-
-- Python 3.8+
-- pandas
-- requests
-- openpyxl (Excel export)
-
-## Sample Output
-
-```
-=== Backtest Results ===
-Period  Hold Start   Hold End   Return    Cumulative
-──────────────────────────────────────────────────────
-1       2020-01-01   2020-12-31  +45.2%    +45.2%
-2       2021-01-01   2021-12-31  +12.8%    +63.8%
-3       2022-01-01   2022-12-31  -18.5%    +33.5%
-
-Best:  삼성전자 (+89.2%)
-Worst: 카카오 (-45.1%)
-```
-
-## License
-
-MIT
+---
 
 ## Disclaimer
 
-This tool is for educational and research purposes only. Past performance does not guarantee future results. This is not financial advice.
+For educational and research purposes only. Past performance does not guarantee future results. Not financial advice.

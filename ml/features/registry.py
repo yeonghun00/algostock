@@ -13,10 +13,17 @@ class FeatureGroup(ABC):
 
     phase=1: runs before universe filters and external merges (price-based features)
     phase=2: runs after universe filters and external merges (needs sector/market data)
+
+    columns:       columns exposed as model features (included in FEATURE_COLUMNS).
+    produced_cols: ALL columns written by compute(), including intermediates that are
+                   NOT model features (e.g. ret_1d, mom_Nd).  Used by resolve_order()
+                   so downstream groups can declare dependencies on these intermediates.
+                   Defaults to columns when not overridden.
     """
 
     name: str = ""
     columns: list[str] = []
+    produced_cols: list[str] = []   # override to declare intermediate outputs
     dependencies: list[str] = []
     phase: int = 2  # default: runs after all merges
 
@@ -48,6 +55,15 @@ def get_all_feature_columns() -> list[str]:
     return cols
 
 
+def get_feature_group_map() -> dict[str, str]:
+    """Return mapping of feature column name → group name."""
+    mapping: dict[str, str] = {}
+    for group_cls in _FEATURE_GROUPS:
+        for col in group_cls.columns:
+            mapping[col] = group_cls.name
+    return mapping
+
+
 def resolve_order(groups: list[type[FeatureGroup]]) -> list[type[FeatureGroup]]:
     """Topological sort: run groups whose dependencies are satisfied first.
 
@@ -71,7 +87,10 @@ def resolve_order(groups: list[type[FeatureGroup]]) -> list[type[FeatureGroup]]:
         for g in remaining:
             if all(dep in available_cols for dep in g.dependencies):
                 ordered.append(g)
+                # Track both model features (columns) and intermediate outputs
+                # (produced_cols) so downstream dependency declarations work.
                 available_cols.update(g.columns)
+                available_cols.update(getattr(g, "produced_cols", []))
                 progress = True
             else:
                 next_remaining.append(g)

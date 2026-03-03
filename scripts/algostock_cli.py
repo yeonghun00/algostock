@@ -14,6 +14,9 @@ Combines ETL operations and stock screening into a single tool with subcommands:
     algostock analyze combined - Combined screening
 
     algostock quick           - Quick screening for current year
+
+    algostock adj-price build     - Build adj_daily_prices from change_rate chain (수정주가)
+    algostock adj-price validate  - Validate Samsung 2018 50:1 split spot-check
 """
 
 import argparse
@@ -321,6 +324,22 @@ def validate_index_types(index_types_str: str) -> list:
     return types
 
 
+def cmd_adj_price_build(args):
+    """Build adj_daily_prices table (수정주가 복원)."""
+    from etl.adj_price_etl import AdjPriceETL
+    etl = AdjPriceETL(db_path=args.db_path)
+    etl.run(skip_validate=args.no_validate)
+
+
+def cmd_adj_price_validate(args):
+    """Validate adj_daily_prices table against known Samsung split."""
+    from etl.adj_price_etl import AdjPriceETL
+    etl = AdjPriceETL(db_path=args.db_path)
+    ok = etl.validate_only()
+    if not ok:
+        sys.exit(1)
+
+
 def cmd_index_status(args):
     """Show index data status."""
     from etl.index_etl import IndexETLPipeline
@@ -390,11 +409,29 @@ def cmd_index_backfill(args):
                 dates.append(current.strftime('%Y%m%d'))
             current += timedelta(days=1)
 
-        # Get existing dates if not forcing
+        # Get existing dates if not forcing.
+        # Check ALL requested tables — a date is "complete" only when every
+        # requested table has data for it.  Previously only market_indices was
+        # checked, so bond/deriv/govt dates were silently skipped.
         if not args.force:
-            existing = pipeline.get_existing_dates(args.start_date, args.end_date, 'market_indices')
-            dates = [d for d in dates if d not in existing]
-            print(f"Skipping {len(existing)} dates with existing data")
+            _TYPE_TABLE_MAP = {
+                'kospi_index': 'index_daily_prices',
+                'kosdaq_index': 'index_daily_prices',
+                'bond_index': 'bond_index_daily',
+                'govt_bond': 'govt_bond_daily',
+                'derivatives': 'deriv_index_daily',
+            }
+            tables_needed = {_TYPE_TABLE_MAP[t] for t in args.index_types if t in _TYPE_TABLE_MAP}
+            if tables_needed:
+                existing_sets = [
+                    pipeline.get_existing_dates(args.start_date, args.end_date, tbl)
+                    for tbl in tables_needed
+                ]
+                fully_existing = existing_sets[0].intersection(*existing_sets[1:])
+            else:
+                fully_existing = set()
+            dates = [d for d in dates if d not in fully_existing]
+            print(f"Skipping {len(fully_existing)} dates with complete data in all requested tables")
 
         if not dates:
             print("No dates to process. Use --force to reprocess existing data.")
@@ -453,13 +490,25 @@ def cmd_index_update(args):
     print(f"Running index update for {date}")
     print(f"Index types: {', '.join(args.index_types)}")
 
+    _TYPE_TABLE_MAP = {
+        'kospi_index': 'index_daily_prices',
+        'kosdaq_index': 'index_daily_prices',
+        'bond_index': 'bond_index_daily',
+        'govt_bond': 'govt_bond_daily',
+        'derivatives': 'deriv_index_daily',
+    }
+
     with IndexETLPipeline(args.db_path) as pipeline:
         pipeline.init_tables()
 
-        # Check if data exists
-        if not args.force and pipeline.check_date_exists(date, 'market_indices'):
-            print(f"Data already exists for {date}. Use --force to reprocess.")
-            return
+        # Check if data exists for ALL requested index types (each in its own table).
+        # Previously this only checked index_daily_prices (KOSPI/KOSDAQ), causing
+        # bond_index_daily / deriv_index_daily / govt_bond_daily to be skipped.
+        if not args.force:
+            tables_needed = {_TYPE_TABLE_MAP[t] for t in args.index_types if t in _TYPE_TABLE_MAP}
+            if tables_needed and all(pipeline.check_date_exists(date, tbl) for tbl in tables_needed):
+                print(f"Data already exists for {date} (all requested types). Use --force to reprocess.")
+                return
 
         try:
             index_data = api.fetch_index_data_parallel(date, args.index_types, is_backfill=False)
@@ -792,157 +841,114 @@ def cmd_quick(args):
 # ML Commands
 # =============================================================================
 
+def _print_legacy_ml_backtest_deprecated() -> None:
+    print("=" * 70)
+    print("LEGACY ML BACKTEST IS DEPRECATED")
+    print("=" * 70)
+    print("ml/backtest.py 경로는 폐기되었습니다.")
+    print("통합 엔진을 사용하세요:")
+    print("  python3 scripts/run_backtest.py --help")
+    print("예시:")
+    print("  python3 scripts/run_backtest.py --start 20200101 --end 20251231 --output raw_reaudit")
+
+
 def cmd_ml_backtest(args):
     """Run ML factor model backtest."""
-    from ml.backtest import MLBacktester
-
-    print("=" * 70)
-    print("ML FACTOR RANKING MODEL BACKTEST")
-    print("=" * 70)
-    print(f"Period: {args.start_date} to {args.end_date}")
-    print(f"Config: {args.n_stocks} stocks, {args.holding_days}d holding, {args.train_years}y training")
-    print(f"Model: {args.model_type}, Weighting: {args.weighting}")
-    print(f"Markets: {', '.join(args.markets)}")
-    print()
-
-    bt = MLBacktester(args.db_path)
-    results = bt.run_backtest(
-        start_date=args.start_date,
-        end_date=args.end_date,
-        n_stocks=args.n_stocks,
-        holding_days=args.holding_days,
-        train_years=args.train_years,
-        target_horizon=args.target_horizon,
-        weighting=args.weighting,
-        markets=args.markets,
-        model_type=args.model_type
-    )
-
-    bt.print_results(results)
-
-    if args.plot:
-        print("\nGenerating performance charts...")
-        chart_path = bt.plot_results(results)
-        print(f"Chart saved to: {chart_path}")
-
-    if args.export:
-        filepath = bt.export_results()
-        print(f"\nExported to: {filepath}")
+    _print_legacy_ml_backtest_deprecated()
+    sys.exit(2)
 
 
 def cmd_ml_predict(args):
     """Get current ML stock picks."""
-    from ml.backtest import MLBacktester
-
-    print("=" * 70)
-    print("ML STOCK RANKING - CURRENT PICKS")
-    print("=" * 70)
-
-    # Need to train model first via backtest
-    bt = MLBacktester(args.db_path)
-
-    # Run quick training on recent data
-    train_end = args.date or datetime.now().strftime('%Y%m%d')
-    train_start = str(int(train_end[:4]) - args.train_years) + train_end[4:]
-
-    print(f"Training on {train_start} to {train_end}...")
-    print()
-
-    results = bt.run_backtest(
-        start_date=train_start,
-        end_date=train_end,
-        n_stocks=args.n_stocks,
-        train_years=args.train_years,
-        markets=args.markets,
-        model_type='regressor'
-    )
-
-    # Get current picks
-    try:
-        picks = bt.get_current_picks(args.date, args.n_stocks)
-
-        if len(picks) == 0:
-            print("No picks available for the specified date.")
-            return
-
-        print(f"TOP {args.n_stocks} STOCKS BY ML SCORE")
-        print("-" * 70)
-        print(f"{'Rank':<6} {'Code':<8} {'Name':<15} {'Price':>10} {'Score':>8} {'Mom12m':>8}")
-        print("-" * 70)
-
-        for i, (_, row) in enumerate(picks.iterrows(), 1):
-            name = row['name'][:14] if len(row['name']) > 14 else row['name']
-            mom = row.get('mom_12m', 0) or 0
-            print(f"{i:<6} {row['stock_code']:<8} {name:<15} "
-                  f"{row['closing_price']:>10,} {row['ml_score']:>8.3f} {mom:>7.1%}")
-
-        if args.export:
-            filepath = f"ml_picks_{train_end}.csv"
-            picks.to_csv(filepath, index=False)
-            print(f"\nExported to: {filepath}")
-
-    except Exception as e:
-        print(f"Error getting picks: {e}")
-        print("Run 'ml backtest' first to train the model.")
+    _print_legacy_ml_backtest_deprecated()
+    sys.exit(2)
 
 
 def cmd_ml_features(args):
     """Show feature importance from trained model."""
-    from ml.backtest import MLBacktester
+    _print_legacy_ml_backtest_deprecated()
+    sys.exit(2)
 
-    print("=" * 70)
-    print("ML FEATURE IMPORTANCE ANALYSIS")
-    print("=" * 70)
 
-    bt = MLBacktester(args.db_path)
+# =============================================================================
+# Update-All Command
+# =============================================================================
 
-    # Quick training
-    train_end = datetime.now().strftime('%Y%m%d')
-    train_start = str(int(train_end[:4]) - 5) + train_end[4:]
+def cmd_update_all(args):
+    """Run all ETL updates in sequence: stock prices, index data, adj prices, constituents, delisted."""
+    import types
 
-    print(f"Training model on {train_start} to {train_end}...")
-    print()
+    print("=" * 60)
+    print("FULL DATA UPDATE")
+    print("=" * 60)
 
-    results = bt.run_backtest(
-        start_date=train_start,
-        end_date=train_end,
-        train_years=5,
-        markets=args.markets,
-        model_type='regressor'
+    # Step 1: ETL catch-up (stock prices)
+    print("\n[1/5] Stock prices (etl update --catchup)...")
+    etl_args = types.SimpleNamespace(
+        db_path=args.db_path,
+        catchup=True,
+        date=None,
+        markets=['kospi', 'kosdaq'],
+        force=False,
     )
+    try:
+        cmd_etl_update(etl_args)
+    except SystemExit as e:
+        print(f"  ETL update failed (exit {e.code})")
 
-    if not bt.models:
-        print("No model trained.")
-        return
+    # Step 2: Index update
+    print("\n[2/5] Index data (index update)...")
+    index_args = types.SimpleNamespace(
+        db_path=args.db_path,
+        date=None,
+        index_types=['kospi_index', 'kosdaq_index', 'bond_index', 'govt_bond', 'derivatives'],
+        force=False,
+    )
+    try:
+        cmd_index_update(index_args)
+    except SystemExit as e:
+        print(f"  Index update failed (exit {e.code})")
 
-    # Get feature importance
-    latest_model = list(bt.models.values())[-1]
-    importance = latest_model.feature_importance()
+    # Step 3: Adj-price rebuild
+    print("\n[3/5] Adjusted prices (adj-price build)...")
+    adj_args = types.SimpleNamespace(
+        db_path=args.db_path,
+        no_validate=False,
+    )
+    try:
+        cmd_adj_price_build(adj_args)
+    except SystemExit as e:
+        print(f"  Adj-price build failed (exit {e.code})")
 
-    print("FEATURE IMPORTANCE (by gain)")
-    print("-" * 50)
+    # Step 4: Index constituents (auto catch-up from last DB date)
+    print("\n[4/5] Index constituents (catch-up from last date)...")
+    try:
+        from etl.index_constituents_etl import KRXIndexConstituentsDirect
+        processor = KRXIndexConstituentsDirect()
+        processor.update(strategy='skip')
+    except Exception as e:
+        print(f"  Index constituents update failed: {e}")
 
-    max_imp = importance['importance'].max()
-    for _, row in importance.iterrows():
-        bar_len = int(row['importance'] / max_imp * 30)
-        bar = "█" * bar_len
-        print(f"{row['feature']:<25} {bar} {row['importance']:.0f}")
+    # Step 5: Delisted stocks (always full refresh)
+    print("\n[5/5] Delisted stocks (full refresh)...")
+    try:
+        from etl.delisted_stocks_etl import (
+            create_database_table,
+            download_delisted_stocks,
+            insert_delisted_stocks_to_db,
+        )
+        create_database_table(args.db_path)
+        df, _ = download_delisted_stocks()
+        if df is not None:
+            insert_delisted_stocks_to_db(df, args.db_path)
+        else:
+            print("  Failed to download delisted stocks")
+    except Exception as e:
+        print(f"  Delisted stocks update failed: {e}")
 
-    # Interpretation
-    top_feature = importance.iloc[0]['feature']
-    print("\n" + "-" * 50)
-    print("INTERPRETATION:")
-
-    if 'mom' in top_feature.lower():
-        print("→ Momentum-driven alpha: Trend following is key")
-    elif 'turnover' in top_feature.lower() or 'vol' in top_feature.lower():
-        print("→ Liquidity-driven alpha: Volume patterns predict moves")
-    elif 'market_cap' in top_feature.lower():
-        print("→ Size-driven alpha: Small-cap premium is significant")
-    elif 'volatility' in top_feature.lower():
-        print("→ Low-volatility alpha: Risk-adjusted returns matter")
-    else:
-        print(f"→ Top signal: {top_feature}")
+    print("\n" + "=" * 60)
+    print("FULL UPDATE COMPLETE")
+    print("=" * 60)
 
 
 # =============================================================================
@@ -997,6 +1003,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # All-in-one update
+  algostock update-all                              Update everything (prices + index + adj + constituents + delisted)
+
   # ETL Operations (Stock Data)
   algostock etl status                              Show database status
   algostock etl backfill -s 20200101 -e 20251231    Backfill historical data
@@ -1113,6 +1122,22 @@ Examples:
     index_update.set_defaults(func=cmd_index_update)
 
     # -------------------------------------------------------------------------
+    # Adjusted Price Commands (수정주가)
+    # -------------------------------------------------------------------------
+    adj_parser = subparsers.add_parser('adj-price', help='Adjusted price (수정주가) operations')
+    adj_subparsers = adj_parser.add_subparsers(dest='adj_command', help='adj-price commands')
+
+    # adj-price build
+    adj_build = adj_subparsers.add_parser('build', help='Build adj_daily_prices table from change_rate chain')
+    adj_build.add_argument('--no-validate', action='store_true',
+                           help='Skip Samsung 2018 split validation after build')
+    adj_build.set_defaults(func=cmd_adj_price_build)
+
+    # adj-price validate
+    adj_val = adj_subparsers.add_parser('validate', help='Validate adj_daily_prices (Samsung split spot-check)')
+    adj_val.set_defaults(func=cmd_adj_price_validate)
+
+    # -------------------------------------------------------------------------
     # Analysis Commands
     # -------------------------------------------------------------------------
     analyze_parser = subparsers.add_parser('analyze', help='Stock analysis')
@@ -1150,6 +1175,15 @@ Examples:
     analyze_combined = analyze_subparsers.add_parser('combined', help='Combined screening')
     add_analysis_args(analyze_combined, combined=True)
     analyze_combined.set_defaults(func=cmd_analyze_combined)
+
+    # -------------------------------------------------------------------------
+    # Update-All Command
+    # -------------------------------------------------------------------------
+    update_all_parser = subparsers.add_parser(
+        'update-all',
+        help='Run all ETL updates in sequence (stock prices + index + adj prices)',
+    )
+    update_all_parser.set_defaults(func=cmd_update_all)
 
     # -------------------------------------------------------------------------
     # Quick Command
@@ -1270,6 +1304,10 @@ Examples:
 
     if args.command == 'index' and not getattr(args, 'index_command', None):
         index_parser.print_help()
+        sys.exit(1)
+
+    if args.command == 'adj-price' and not getattr(args, 'adj_command', None):
+        adj_parser.print_help()
         sys.exit(1)
 
     # Execute command

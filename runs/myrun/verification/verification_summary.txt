@@ -1,0 +1,23 @@
+========================================================================
+BACKTEST VERIFICATION REPORT
+========================================================================
+Total trade-records             : 480
+  Fully verified (both returns)  : 463
+    ✅  Match  (|Δ| ≤ 5%)        : 462  (99.8%)
+    ⚠️   Discrepancy (|Δ| > 5%)   : 1
+  🔴  Delisted / unavailable      : 0  (skipped from accuracy)
+  ❓  No sell date                : 17
+  ❓  fdr price missing           : 0
+  ❓  BT return missing           : 0
+
+Return accuracy (fully verified trades):
+  Mean   |Δreturn|  : 0.034%
+  Median |Δreturn|  : 0.013%
+  Max    |Δreturn|  : 5.453%
+
+────────────────────────────────────────────────────────────────────────
+TOP DISCREPANCIES  (>5% return diff)  — top 30 shown
+Code       Name           BuyDate     SellDate      BT_Ret  FDR_Ret     Diff
+────────────────────────────────────────────────────────────────────────
+073490     이노와이어리스        20211109    20220113       8.52%   13.98%   -5.45%
+========================================================================

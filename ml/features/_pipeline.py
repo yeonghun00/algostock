@@ -34,7 +34,7 @@ class FeatureEngineer:
     to registered FeatureGroup classes.
     """
 
-    CACHE_VERSION = "unified_v46_annualized_fin_20260214"
+    CACHE_VERSION = "unified_v55_interact_20260228"
     BS_ITEM_CODES = {
         "equity": "ifrs-full_Equity",
         "assets": "ifrs-full_Assets",
@@ -115,22 +115,35 @@ class FeatureEngineer:
         min_market_cap: int,
         markets: List[str],
         universe_end_date: Optional[str] = None,
+        max_market_cap: Optional[int] = None,
     ) -> pd.DataFrame:
         _ = universe_end_date or end_date
         placeholders = ",".join(["?" for _ in markets])
+        max_cap_clause = "AND dp.market_cap <= ?" if max_market_cap else ""
         with self._connect() as conn:
+            # LEFT JOIN adj_daily_prices to get split-adjusted prices.
+            # COALESCE fallback: stocks not yet in adj_daily_prices use raw price.
+            # Raw closing_price is kept for level-based filters (min_price, low_price_trap).
             price_q = f"""
-            SELECT stock_code, date, market_type, closing_price, opening_price,
-                   high_price, low_price, volume, value, market_cap
-            FROM daily_prices
-            WHERE date >= ? AND date <= ?
-              AND market_type IN ({placeholders})
-              AND closing_price > 0
-              AND volume > 0
-              AND market_cap >= ?
-            ORDER BY stock_code, date
+            SELECT dp.stock_code, dp.date, dp.market_type,
+                   dp.closing_price, dp.opening_price,
+                   dp.high_price, dp.low_price, dp.volume, dp.value, dp.market_cap,
+                   COALESCE(adj.adj_closing_price, dp.closing_price) AS adj_closing_price,
+                   COALESCE(adj.adj_opening_price, dp.opening_price) AS adj_opening_price
+            FROM daily_prices dp
+            LEFT JOIN adj_daily_prices adj
+                   ON adj.stock_code = dp.stock_code AND adj.date = dp.date
+            WHERE dp.date >= ? AND dp.date <= ?
+              AND dp.market_type IN ({placeholders})
+              AND dp.closing_price > 0
+              AND dp.volume > 0
+              AND dp.market_cap >= ?
+              {max_cap_clause}
+            ORDER BY dp.stock_code, dp.date
             """
             params = [start_date, end_date] + markets + [min_market_cap]
+            if max_market_cap:
+                params.append(max_market_cap)
             prices = pd.read_sql_query(price_q, conn, params=params)
             stocks = pd.read_sql_query(
                 """
@@ -158,7 +171,16 @@ class FeatureEngineer:
         return merged.loc[keep].drop(columns=["delisting_date"])
 
     def _load_index_membership(self, start_date: str, end_date: str) -> pd.DataFrame:
-        iso_start = self._to_iso(start_date)
+        """Load index constituent snapshots for a date range.
+
+        Loads a small warmup window before start_date so that merge_asof can
+        find the most recent membership entry even for the first price rows.
+        """
+        # Load from 400 days before start to capture the most recent rebalance
+        # snapshot that precedes the window, so merge_asof never misses a stock.
+        iso_start_with_warmup = self._to_iso(
+            (datetime.strptime(start_date, "%Y%m%d") - timedelta(days=400)).strftime("%Y%m%d")
+        )
         iso_end = self._to_iso(end_date)
         conn = self._connect()
         members = pd.read_sql_query(
@@ -169,64 +191,95 @@ class FeatureEngineer:
             GROUP BY membership_date, stock_code
             """,
             conn,
-            params=[iso_start, iso_end],
+            params=[iso_start_with_warmup, iso_end],
         )
         if not members.empty:
             members["membership_date"] = members["membership_date"].astype(str).str.replace("-", "", regex=False)
         return members
 
+    def _merge_index_membership(self, data: pd.DataFrame, members: pd.DataFrame) -> pd.DataFrame:
+        """PIT-join index membership onto price data using merge_asof.
+
+        For each (stock_code, date) in data, picks the most recent membership
+        snapshot whose membership_date <= date.  This correctly handles index
+        rebalances that occur mid-month (the old first-of-month approximation
+        could miss up to 15 trading days of membership changes).
+        """
+        if members.empty:
+            data["constituent_index_count"] = 0.0
+            return data
+        data["_date_dt"] = pd.to_datetime(data["date"], format="%Y%m%d", errors="coerce")
+        right = members.copy()
+        right["_mem_dt"] = pd.to_datetime(right["membership_date"], format="%Y%m%d", errors="coerce")
+        right = right.dropna(subset=["_mem_dt"]).sort_values(["_mem_dt", "stock_code"])
+        merged = pd.merge_asof(
+            data.sort_values(["_date_dt", "stock_code"]),
+            right[["stock_code", "_mem_dt", "constituent_index_count"]],
+            left_on="_date_dt",
+            right_on="_mem_dt",
+            by="stock_code",
+            direction="backward",
+        )
+        merged["constituent_index_count"] = pd.to_numeric(
+            merged["constituent_index_count"], errors="coerce"
+        ).fillna(0.0)
+        merged = merged.drop(columns=["_date_dt", "_mem_dt"], errors="ignore")
+        return merged.sort_values(["stock_code", "date"])
+
     def _load_sector_membership(self, start_date: str, end_date: str) -> pd.DataFrame:
-        iso_start = self._to_iso(start_date)
-        iso_end = self._to_iso(end_date)
+        """Load sector labels from financial_periods.industry_name (point-in-time).
+
+        Returns one row per (stock_code, available_date) with the sector label.
+        The caller should use _merge_sector_pit() to join this onto the price data.
+        start_date/end_date are unused but kept for API compatibility.
+        """
+        del start_date, end_date  # PIT join uses the full history up to end_date at merge time
         conn = self._connect()
-        members = pd.read_sql_query(
+        df = pd.read_sql_query(
             """
-            WITH counts AS (
-                SELECT date AS membership_date, index_code, COUNT(DISTINCT stock_code) AS index_member_count
-                FROM index_constituents
-                WHERE date >= ? AND date <= ?
-                GROUP BY membership_date, index_code
-            ),
-            candidates AS (
-                SELECT
-                    ic.date AS membership_date,
-                    ic.stock_code,
-                    ic.index_code,
-                    c.index_member_count,
-                    CASE
-                        WHEN ic.index_code IN (?, ?, ?, ?) THEN 1
-                        ELSE 0
-                    END AS is_broad
-                FROM index_constituents ic
-                JOIN counts c
-                  ON c.membership_date = ic.date
-                 AND c.index_code = ic.index_code
-                WHERE ic.date >= ? AND ic.date <= ?
-            ),
-            ranked AS (
-                SELECT
-                    membership_date,
-                    stock_code,
-                    index_code AS sector_index_code,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY membership_date, stock_code
-                        ORDER BY is_broad ASC, index_member_count ASC, LENGTH(index_code) DESC, index_code ASC
-                    ) AS rn
-                FROM candidates
-            )
-            SELECT REPLACE(membership_date, '-', '') AS membership_date, stock_code, sector_index_code
-            FROM ranked
-            WHERE rn = 1
+            SELECT DISTINCT
+                stock_code,
+                REPLACE(available_date, '-', '') AS available_date,
+                industry_name AS sector
+            FROM financial_periods
+            WHERE industry_name IS NOT NULL
+              AND TRIM(industry_name) != ''
+            ORDER BY stock_code, available_date
             """,
             conn,
-            params=[
-                iso_start, iso_end,
-                self.BROAD_INDEX_CODES[0], self.BROAD_INDEX_CODES[1],
-                self.BROAD_INDEX_CODES[2], self.BROAD_INDEX_CODES[3],
-                iso_start, iso_end,
-            ],
         )
-        return members
+        if df.empty:
+            return pd.DataFrame(columns=["stock_code", "available_date", "sector"])
+        # Normalize sector names: remove all whitespace to merge duplicates caused by
+        # inconsistent spacing in KSIC labels (e.g. "전자부품 제조업" vs "전자 부품 제조업")
+        df["sector"] = df["sector"].str.replace(r"\s+", "", regex=True)
+        df = df.drop_duplicates(["stock_code", "available_date"], keep="last")
+        return df
+
+    def _merge_sector_pit(self, data: pd.DataFrame, sector_pit: pd.DataFrame) -> pd.DataFrame:
+        """PIT-join industry_name from financial_periods onto the price data.
+
+        For each (stock_code, date) row in *data*, picks the most recent
+        industry_name whose available_date <= date.  Sets data["sector"].
+        """
+        if sector_pit.empty:
+            data["sector"] = "UNMAPPED_SECTOR"
+            return data
+        data["_date_dt"] = pd.to_datetime(data["date"], format="%Y%m%d", errors="coerce")
+        right = sector_pit.copy()
+        right["_avail_dt"] = pd.to_datetime(right["available_date"], format="%Y%m%d", errors="coerce")
+        right = right.dropna(subset=["_avail_dt"]).sort_values(["_avail_dt", "stock_code"])
+        merged = pd.merge_asof(
+            data.sort_values(["_date_dt", "stock_code"]),
+            right[["stock_code", "_avail_dt", "sector"]],
+            left_on="_date_dt",
+            right_on="_avail_dt",
+            by="stock_code",
+            direction="backward",
+        )
+        merged["sector"] = merged["sector"].fillna("UNMAPPED_SECTOR")
+        merged = merged.drop(columns=["_date_dt", "_avail_dt"], errors="ignore")
+        return merged.sort_values(["stock_code", "date"])
 
     def _load_market_regime(self, start_date: str, end_date: str, target_horizon: int) -> pd.DataFrame:
         with self._connect() as conn:
@@ -242,59 +295,183 @@ class FeatureEngineer:
                 params=[start_date, end_date],
             )
         if idx.empty:
+            print(
+                "[Pipeline] WARNING: KOSPI_코스피_200 has NO data in index_daily_prices for "
+                f"{start_date}–{end_date}. All market-regime features will be 0/NaN. "
+                "Run: algostock index backfill -s <start> -e <end> -t kospi_index --force",
+                flush=True,
+            )
             return pd.DataFrame(columns=["date", "market_regime_120d", "market_regime_20d", "market_ret_1d", f"market_forward_return_{target_horizon}d"])
+        # Warn if coverage is sparse (< 60% of expected trading days ≈ 252/year).
+        n_days = (pd.to_datetime(end_date) - pd.to_datetime(start_date)).days
+        expected_trading_days = max(1, int(n_days * 5 / 7 * 0.98))  # rough weekday estimate
+        coverage = len(idx) / expected_trading_days
+        if coverage < 0.6:
+            print(
+                f"[Pipeline] WARNING: KOSPI_코스피_200 coverage is only {coverage:.1%} "
+                f"({len(idx)} rows vs ~{expected_trading_days} expected) for {start_date}–{end_date}. "
+                "Market-regime features will be unreliable. "
+                "Run: algostock index backfill -s <start> -e <end> -t kospi_index --force",
+                flush=True,
+            )
         idx["market_regime_120d"] = idx["closing_index"] / idx["closing_index"].rolling(120, min_periods=60).mean() - 1
         idx["market_regime_20d"] = idx["closing_index"] / idx["closing_index"].rolling(20, min_periods=10).mean() - 1
         idx["market_ret_1d"] = idx["closing_index"].pct_change()
         idx[f"market_forward_return_{target_horizon}d"] = idx["closing_index"].shift(-target_horizon) / idx["closing_index"] - 1
         return idx[["date", "market_regime_120d", "market_regime_20d", "market_ret_1d", f"market_forward_return_{target_horizon}d"]]
 
-    def _load_sector_index_returns(self, start_date: str, end_date: str) -> pd.DataFrame:
-        with self._connect() as conn:
-            df = pd.read_sql_query(
-                """
-                SELECT date, index_code, closing_index
-                FROM index_daily_prices
-                WHERE date >= ? AND date <= ?
-                  AND (index_code LIKE 'KOSPI_%' OR index_code LIKE 'KOSDAQ_%')
-                ORDER BY index_code, date
-                """,
-                conn,
-                params=[start_date, end_date],
-            )
-        if df.empty:
-            return pd.DataFrame(columns=[
-                "date", "sector",
-                "sector_momentum_21d", "sector_momentum_63d",
-                "sector_relative_momentum_20d", "sector_relative_momentum_21d", "sector_relative_momentum_63d",
-            ])
-        benchmark = (
-            df[df["index_code"] == "KOSPI_코스피"][["date", "closing_index"]]
-            .rename(columns={"closing_index": "market_index_close"})
-            .copy()
-        )
-        benchmark["market_mom_20d"] = benchmark["market_index_close"].pct_change(20)
-        benchmark["market_mom_21d"] = benchmark["market_index_close"].pct_change(21)
-        benchmark["market_mom_63d"] = benchmark["market_index_close"].pct_change(63)
+    def _load_macro_indices(self, start_date: str, end_date: str) -> pd.DataFrame:
+        """Load deriv_index_daily data and compute 13 macro features (V5.5 Macro Layer).
 
-        df = df.copy()
-        grouped = df.groupby("index_code")
-        df["sector_momentum_21d"] = grouped["closing_index"].pct_change(21, fill_method=None)
-        df["sector_momentum_20d"] = grouped["closing_index"].pct_change(20, fill_method=None)
-        df["sector_momentum_63d"] = grouped["closing_index"].pct_change(63, fill_method=None)
-        df = df.merge(
-            benchmark[["date", "market_mom_20d", "market_mom_21d", "market_mom_63d"]],
-            on="date", how="left",
-        )
-        df["sector_relative_momentum_20d"] = df["sector_momentum_20d"] - df["market_mom_20d"]
-        df["sector_relative_momentum_21d"] = df["sector_momentum_21d"] - df["market_mom_21d"]
-        df["sector_relative_momentum_63d"] = df["sector_momentum_63d"] - df["market_mom_63d"]
+        All raw signals are normalized via a 252-day rolling percentile so that
+        features with different units land on the same [0, 1] scale as stock
+        features.  NaN values (pre-history indices or warmup period) are filled
+        with 0.5 (neutral percentile).
 
-        return df.rename(columns={"index_code": "sector"})[
-            ["date", "sector",
-             "sector_momentum_21d", "sector_momentum_63d",
-             "sector_relative_momentum_20d", "sector_relative_momentum_21d", "sector_relative_momentum_63d"]
+        Returns a date-indexed DataFrame (date in YYYYMMDD string format) with
+        13 macro feature columns ready to merge onto the stock-level DataFrame.
+        """
+        MACRO_CODES = [
+            "DERIV_전략지수_국채선물_3년_10년_일드커브_스티프닝_지수",
+            "DERIV_전략지수_국채선물_3년_10년_일드커브_플래트닝_지수",
+            "DERIV_선물지수_미국달러선물지수",
+            "DERIV_선물지수_엔선물지수",
+            "DERIV_옵션지수_코스피_200_변동성지수",
+            "DERIV_전략지수_코스피_200_TR",
+            "DERIV_옵션지수_코스피_200_커버드콜_5%_OTM_지수",
+            "DERIV_전략지수_코스닥150_롱_100%_코스피200_숏_100%_선물지수",
+            "DERIV_전략지수_KRX_반도체_TR_지수",
+            "DERIV_전략지수_KRX_2차전지_TOP_10_TR_지수",
+            "DERIV_전략지수_KRX_BBIG_리스크컨트롤_12%_지수",
+            "DERIV_전략지수_KRX_300_TR",
         ]
+        iso_start = self._to_iso(start_date)
+        iso_end = self._to_iso(end_date)
+        placeholders = ",".join(["?" for _ in MACRO_CODES])
+        try:
+            with self._connect() as conn:
+                raw = pd.read_sql_query(
+                    f"""
+                    SELECT REPLACE(date, '-', '') AS date, index_code, closing_index
+                    FROM deriv_index_daily
+                    WHERE date >= ? AND date <= ?
+                      AND index_code IN ({placeholders})
+                    ORDER BY date
+                    """,
+                    conn,
+                    params=[iso_start, iso_end] + MACRO_CODES,
+                )
+        except Exception as exc:
+            self.logger.warning("[Pipeline] _load_macro_indices: deriv_index_daily unavailable: %s", exc)
+            return pd.DataFrame(columns=["date"])
+
+        if raw.empty:
+            self.logger.warning(
+                "[Pipeline] _load_macro_indices: no data for %s–%s. "
+                "Run: algostock index backfill -t derivatives --force",
+                start_date, end_date,
+            )
+            return pd.DataFrame(columns=["date"])
+
+        raw["closing_index"] = pd.to_numeric(raw["closing_index"], errors="coerce")
+        wide = raw.pivot_table(
+            index="date", columns="index_code", values="closing_index", aggfunc="last"
+        )
+        wide.columns.name = None
+        wide = wide.sort_index()
+
+        def pct_norm(s: pd.Series, window: int = 252, min_periods: int = 60) -> pd.Series:
+            """252-day rolling percentile normalization → [0, 1]. Robust to outliers."""
+            return s.rolling(window, min_periods=min_periods).rank(pct=True)
+
+        macro = pd.DataFrame(index=wide.index)
+
+        # --- Group A: Interest Rate — Yield Curve ---
+        steep = wide.get("DERIV_전략지수_국채선물_3년_10년_일드커브_스티프닝_지수")
+        flat  = wide.get("DERIV_전략지수_국채선물_3년_10년_일드커브_플래트닝_지수")
+        if steep is not None and flat is not None:
+            yc_regime = steep.pct_change(20, fill_method=None) - flat.pct_change(20, fill_method=None)
+            macro["yield_curve_regime"] = pct_norm(yc_regime)
+            macro["yield_curve_momentum_5d"] = pct_norm(yc_regime.pct_change(5, fill_method=None))
+        else:
+            macro["yield_curve_regime"] = np.nan
+            macro["yield_curve_momentum_5d"] = np.nan
+
+        # --- Group B: Currency — FX Pressure ---
+        usd = wide.get("DERIV_선물지수_미국달러선물지수")
+        jpy = wide.get("DERIV_선물지수_엔선물지수")
+        if usd is not None:
+            macro["usd_pressure_5d"] = pct_norm(usd.pct_change(5, fill_method=None))
+            macro["usd_ma_ratio_20d"] = pct_norm(
+                usd / usd.rolling(20, min_periods=10).mean() - 1
+            )
+        else:
+            macro["usd_pressure_5d"] = np.nan
+            macro["usd_ma_ratio_20d"] = np.nan
+        if usd is not None and jpy is not None:
+            usd_r20 = usd.pct_change(20, fill_method=None)
+            jpy_r20 = jpy.pct_change(20, fill_method=None)
+            fx_idx = usd_r20 / jpy_r20.replace(0, np.nan)
+            macro["fx_pressure_index"] = pct_norm(fx_idx)
+        else:
+            macro["fx_pressure_index"] = np.nan
+
+        # --- Group C: Sentiment — Volatility ---
+        vkos   = wide.get("DERIV_옵션지수_코스피_200_변동성지수")
+        k200tr = wide.get("DERIV_전략지수_코스피_200_TR")
+        cc5otm = wide.get("DERIV_옵션지수_코스피_200_커버드콜_5%_OTM_지수")
+        if vkos is not None:
+            macro["vkospi_level_pct"] = pct_norm(vkos)
+            macro["vkospi_change_5d"] = pct_norm(vkos.pct_change(5, fill_method=None))
+        else:
+            macro["vkospi_level_pct"] = np.nan
+            macro["vkospi_change_5d"] = np.nan
+        if k200tr is not None and cc5otm is not None:
+            vol_eff = k200tr.pct_change(20, fill_method=None) - cc5otm.pct_change(20, fill_method=None)
+            macro["market_vol_efficiency"] = pct_norm(vol_eff)
+        else:
+            macro["market_vol_efficiency"] = np.nan
+
+        # --- Group D: Relative Strength — KOSDAQ/KOSPI Rotation ---
+        rot = wide.get("DERIV_전략지수_코스닥150_롱_100%_코스피200_숏_100%_선물지수")
+        if rot is not None:
+            ma5  = rot.rolling(5, min_periods=3).mean()
+            ma20 = rot.rolling(20, min_periods=10).mean()
+            rot_signal = ma5 / ma20.replace(0, np.nan) - 1
+            macro["kosdaq_kospi_rotation"] = pct_norm(rot_signal)
+            macro["rotation_momentum_5d"] = pct_norm(rot.pct_change(5, fill_method=None))
+        else:
+            macro["kosdaq_kospi_rotation"] = np.nan
+            macro["rotation_momentum_5d"] = np.nan
+
+        # --- Group E: Sector Leadership vs KRX 300 TR ---
+        semi   = wide.get("DERIV_전략지수_KRX_반도체_TR_지수")
+        batt   = wide.get("DERIV_전략지수_KRX_2차전지_TOP_10_TR_지수")
+        bbig   = wide.get("DERIV_전략지수_KRX_BBIG_리스크컨트롤_12%_지수")
+        krx300 = wide.get("DERIV_전략지수_KRX_300_TR")
+        if krx300 is not None:
+            bm_r21 = krx300.pct_change(21, fill_method=None)
+            macro["sector_semicon_rel_21d"] = (
+                pct_norm(semi.pct_change(21, fill_method=None) - bm_r21)
+                if semi is not None else np.nan
+            )
+            macro["sector_battery_rel_21d"] = (
+                pct_norm(batt.pct_change(21, fill_method=None) - bm_r21)
+                if batt is not None else np.nan
+            )
+            macro["sector_bbig_rel_21d"] = (
+                pct_norm(bbig.pct_change(21, fill_method=None) - bm_r21)
+                if bbig is not None else np.nan
+            )
+        else:
+            macro["sector_semicon_rel_21d"] = np.nan
+            macro["sector_battery_rel_21d"] = np.nan
+            macro["sector_bbig_rel_21d"] = np.nan
+
+        # Fill NaN (warmup period, short-history indices pre-2015/2016) → 0.5 neutral
+        macro = macro.fillna(0.5)
+        macro = macro.reset_index()  # 'date' becomes a column
+        return macro
 
     def _load_financial_ratios_pit(self, stock_codes: List[str], end_date: str) -> pd.DataFrame:
         if not stock_codes:
@@ -496,7 +673,40 @@ class FeatureEngineer:
         residual_col = f"target_residual_{target_horizon}d"
         residual_rank_col = f"target_residual_rank_{target_horizon}d"
 
-        out[fwd_col] = g["closing_price"].shift(-target_horizon) / out["closing_price"] - 1
+        # Use adj_closing_price so splits within the horizon don't create
+        # fake large returns (e.g. a 50:1 split mid-period looks like −98%).
+        price_col = "adj_closing_price" if "adj_closing_price" in out.columns else "closing_price"
+
+        # fwd_col is pre-computed on the UNFILTERED series in _prepare_range_core
+        # (before _apply_hard_universe_filters) so that row gaps from filters like
+        # bad_accrual do not distort shift(-N).  Only recompute here as a fallback
+        # when called outside of _prepare_range_core (e.g. unit tests).
+        if fwd_col not in out.columns:
+            out[fwd_col] = g[price_col].shift(-target_horizon) / out[price_col] - 1
+
+            # --- Survivorship-bias fix for suspended / delisted stocks ---
+            # last_price: last available adj price for each stock in the dataset.
+            # For delisted stocks this is the final crash/M&A price before delisting.
+            last_price = g[price_col].transform("last")
+
+            # Fix A: NaN forward return → stock was delisted before T+horizon.
+            nan_mask = out[fwd_col].isna() & out[price_col].gt(0)
+            out.loc[nan_mask, fwd_col] = (
+                last_price[nan_mask] / out.loc[nan_mask, price_col] - 1
+            )
+
+            # Fix B: Frozen price at T+horizon → stock was suspended (거래정지).
+            if "value" in out.columns:
+                future_value = g["value"].shift(-target_horizon)
+                frozen_mask = (
+                    out[fwd_col].notna()
+                    & out[price_col].gt(0)
+                    & (future_value == 0)
+                )
+                out.loc[frozen_mask, fwd_col] = (
+                    last_price[frozen_mask] / out.loc[frozen_mask, price_col] - 1
+                )
+
         out[rank_col] = out.groupby("date")[fwd_col].rank(method="average", pct=True).fillna(0.5)
         vol = out["volatility_21d"] if "volatility_21d" in out.columns else np.nan
         out[risk_adj_col] = out[fwd_col] / pd.to_numeric(vol, errors="coerce").replace(0, np.nan)
@@ -518,7 +728,10 @@ class FeatureEngineer:
         start_dt = datetime.strptime(start_date, "%Y%m%d")
         end_dt = datetime.strptime(end_date, "%Y%m%d")
         warmup_days = 420
-        lookahead_days = max(target_horizon + 7, 42)
+        # Convert trading-day horizon to calendar days with a safety buffer.
+        # 42 trading days ≈ 63 calendar days (× 7/5).  Add 15-day buffer for
+        # holidays and month-end signals so shift(-N) always has enough lookahead.
+        lookahead_days = max(int(target_horizon * 7 / 5) + 15, 42)
         chunks: List[dict] = []
         for year in range(start_dt.year, end_dt.year + 1):
             trim_start = max(start_dt, datetime(year, 1, 1))
@@ -548,10 +761,12 @@ class FeatureEngineer:
         min_market_cap: int,
         markets: List[str],
         universe_end_date: Optional[str] = None,
+        max_market_cap: Optional[int] = None,
     ) -> pd.DataFrame:
         raw = self._load_prices(
             start_date, end_date, min_market_cap, markets,
             universe_end_date=universe_end_date or end_date,
+            max_market_cap=max_market_cap,
         )
         if raw.empty:
             return raw
@@ -560,17 +775,12 @@ class FeatureEngineer:
 
         # --- External data merges ---
         members = self._load_index_membership(start_date, end_date)
-        sector_members = self._load_sector_membership(start_date, end_date)
+        sector_pit = self._load_sector_membership(start_date, end_date)
         regime = self._load_market_regime(start_date, end_date, target_horizon)
-        sector_index_returns = self._load_sector_index_returns(start_date, end_date)
+        macro_regime = self._load_macro_indices(start_date, end_date)
 
-        data["membership_date"] = data["date"].str[:6] + "01"
-        data = data.merge(members, on=["membership_date", "stock_code"], how="left")
-        data = data.merge(sector_members, on=["membership_date", "stock_code"], how="left")
-        data["sector"] = data["sector_index_code"].fillna("UNMAPPED_SECTOR_INDEX")
-        data["constituent_index_count"] = pd.to_numeric(
-            data["constituent_index_count"], errors="coerce"
-        ).fillna(0.0)
+        data = self._merge_index_membership(data, members)
+        data = self._merge_sector_pit(data, sector_pit)
 
         fin_pit = self._load_financial_ratios_pit(data["stock_code"].unique().tolist(), end_date)
         data = self._merge_financial_features(data, fin_pit)
@@ -587,29 +797,48 @@ class FeatureEngineer:
             group = group_cls()
             data = group.compute(data)
 
+        # --- Pre-compute forward return on COMPLETE (unfiltered) per-stock time series ---
+        # MUST run before _apply_hard_universe_filters.  Filters like bad_accrual and
+        # avg_value_20d remove rows from the DataFrame, creating calendar gaps in each
+        # stock's series.  shift(-N) on the gapped series lands at the wrong calendar date
+        # (e.g. shift(-42) from 2020-03-04 jumps to 2020-09-17 instead of 2020-05-07 when
+        # the bad_accrual filter removes all rows between 2020-04-01 and 2020-08-15).
+        _fwd_col = f"forward_return_{target_horizon}d"
+        _pc = "adj_closing_price" if "adj_closing_price" in data.columns else "closing_price"
+        data = data.sort_values(["stock_code", "date"])
+        _g = data.groupby("stock_code")
+        data[_fwd_col] = _g[_pc].shift(-target_horizon) / data[_pc] - 1
+        _last_px = _g[_pc].transform("last")
+        # Fix A: NaN (delisted / data tail before T+horizon)
+        _nm = data[_fwd_col].isna() & data[_pc].gt(0)
+        data.loc[_nm, _fwd_col] = _last_px[_nm] / data.loc[_nm, _pc] - 1
+        # Fix B: frozen price (거래정지) at T+horizon
+        if "value" in data.columns:
+            _fv = _g["value"].shift(-target_horizon)
+            _fm = data[_fwd_col].notna() & data[_pc].gt(0) & (_fv == 0)
+            data.loc[_fm, _fwd_col] = _last_px[_fm] / data.loc[_fm, _pc] - 1
+
         # --- Universe filters (after volume/price features are computed) ---
         data = self._apply_hard_universe_filters(data, min_price=2000, liquidity_drop_pct=0.20)
-
-        # --- Merge sector index returns ---
-        data = data.merge(sector_index_returns, on=["date", "sector"], how="left")
 
         # --- Merge market regime ---
         data = data.merge(regime, on="date", how="left")
         data["market_regime_120d"] = data["market_regime_120d"].fillna(0.0)
+        # market_regime_20d must also be filled: NaN leaves the cash-out rule permanently disabled
+        # for any date where index data is missing (most years in the current DB).
+        data["market_regime_20d"] = data["market_regime_20d"].fillna(0.0)
         data["market_ret_1d"] = data["market_ret_1d"].fillna(0.0)
         data[f"market_forward_return_{target_horizon}d"] = data[f"market_forward_return_{target_horizon}d"].fillna(0.0)
 
+        # --- Merge macro features (deriv_index_daily) ---
+        _macro_cols = [c for c in macro_regime.columns if c != "date"]
+        if _macro_cols:
+            data = data.merge(macro_regime, on="date", how="left")
+            for col in _macro_cols:
+                data[col] = data[col].fillna(0.5)
+
         # --- Rolling beta (needs market_ret_1d from regime) ---
         data = self._compute_rolling_beta(data)
-
-        # --- Fill sector momentum NaNs ---
-        for col in [
-            "sector_momentum_21d", "sector_momentum_63d",
-            "sector_relative_momentum_20d", "sector_relative_momentum_21d",
-            "sector_relative_momentum_63d",
-        ]:
-            if col in data.columns:
-                data[col] = data[col].fillna(0.0)
 
         # --- Phase 2: feature groups needing sector/market data ---
         for group_cls in phase2_groups:
@@ -631,6 +860,7 @@ class FeatureEngineer:
         end_date: str,
         target_horizon: int = 21,
         min_market_cap: int = 500_000_000_000,
+        max_market_cap: Optional[int] = None,
         markets: Optional[List[str]] = None,
         include_fundamental: bool = True,
         include_macro: bool = True,
@@ -644,8 +874,9 @@ class FeatureEngineer:
         workers = max(1, n_workers or 4)
 
         feature_columns = self.FEATURE_COLUMNS
+        max_cap_key = f"_max{max_market_cap}" if max_market_cap else ""
         cache_key = (
-            f"{self.CACHE_VERSION}_{start_date}_{end_date}_{target_horizon}_{min_market_cap}_"
+            f"{self.CACHE_VERSION}_{start_date}_{end_date}_{target_horizon}_{min_market_cap}{max_cap_key}_"
             f"{'_'.join(sorted(markets))}"
         )
         cache_path = self._cache_path(cache_key)
@@ -679,6 +910,7 @@ class FeatureEngineer:
                     end_date=chunk["core_end"],
                     target_horizon=target_horizon,
                     min_market_cap=min_market_cap,
+                    max_market_cap=max_market_cap,
                     markets=markets,
                     universe_end_date=chunk["trim_end"],
                 )
@@ -700,6 +932,7 @@ class FeatureEngineer:
                     "trim_end": c["trim_end"],
                     "target_horizon": target_horizon,
                     "min_market_cap": min_market_cap,
+                    "max_market_cap": max_market_cap,
                     "markets": markets,
                     "year": c["year"],
                     "universe_end_date": c["trim_end"],
@@ -764,6 +997,7 @@ class FeatureEngineer:
         end_date: str,
         target_horizon: int = 21,
         min_market_cap: int = 500_000_000_000,
+        max_market_cap: Optional[int] = None,
         markets: Optional[List[str]] = None,
     ) -> pd.DataFrame:
         markets = markets or ["kospi", "kosdaq"]
@@ -780,6 +1014,7 @@ class FeatureEngineer:
             end_date=end_date,
             target_horizon=target_horizon,
             min_market_cap=min_market_cap,
+            max_market_cap=max_market_cap,
             markets=markets,
         )
 
@@ -809,6 +1044,7 @@ def _prepare_year_chunk_worker(payload: dict) -> pd.DataFrame:
         end_date=payload["core_end"],
         target_horizon=payload["target_horizon"],
         min_market_cap=payload["min_market_cap"],
+        max_market_cap=payload.get("max_market_cap"),
         markets=payload["markets"],
         universe_end_date=payload.get("universe_end_date", payload["core_end"]),
     )

@@ -11,7 +11,9 @@ from .registry import FeatureGroup, register
 @register
 class VolumeFeatures(FeatureGroup):
     name = "volume"
-    columns = ["volume_ratio_21d", "turnover_21d", "amihud_21d"]
+    # turnover_21d has a sector-neutral version; amihud and volume_ratio are kept raw
+    # as pure liquidity signals (less sector-contaminated).
+    columns = ["volume_ratio_21d", "amihud_21d"]
     dependencies = ["ret_1d", "closing_price"]
     phase = 1
 

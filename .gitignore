@@ -52,3 +52,5 @@ picks_*.csv
 
 # Doc
 # doc/
+.env
+live/orders/

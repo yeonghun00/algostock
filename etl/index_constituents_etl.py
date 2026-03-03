@@ -92,7 +92,7 @@ class KRXIndexConstituentsDirect:
         self._cached_indices = {}  # {market: indices_list}
     
     def _create_table(self):
-        """Create the index_constituents table if it doesn't exist."""
+        """Create the index_constituents and index_category_mapping tables if they don't exist."""
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS index_constituents (
@@ -102,6 +102,14 @@ class KRXIndexConstituentsDirect:
                     stock_code TEXT NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(date, index_code, stock_code)
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS index_category_mapping (
+                    index_code TEXT PRIMARY KEY,
+                    category TEXT,
+                    market TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             conn.commit()
@@ -176,46 +184,66 @@ class KRXIndexConstituentsDirect:
             try:
                 table_container = driver.find_element(By.CSS_SELECTOR, "tbody.CI-GRID-BODY-TABLE-TBODY")
                 print("Found scrollable table container, scrolling to load all indices...")
-                
+
                 # Track unique links using a set of (name, href) tuples
                 seen_links = set()
                 scroll_attempts = 0
                 max_scroll_attempts = 200  # Safety limit
                 scroll_increment = 300  # Pixels to scroll each time
                 no_progress_count = 0
-                
+                current_category = ''  # Track 구분 category across rows (rowspan pattern)
+
                 while scroll_attempts < max_scroll_attempts:
-                    # Find all currently visible links before scrolling
-                    links = driver.find_elements(By.CSS_SELECTOR, 'a[href*="MKD03040101.jsp"]')
-                    
+                    # Iterate rows to track category (구분 uses rowspan, so some rows only have the link td)
+                    rows = driver.find_elements(By.CSS_SELECTOR, 'tbody.CI-GRID-BODY-TABLE-TBODY tr')
+
                     new_links_found = 0
-                    for link in links:
-                        href = link.get_attribute('href') or ''
-                        text = link.text.strip()
-                        
-                        if not text:
+                    for row in rows:
+                        tds = row.find_elements(By.TAG_NAME, 'td')
+                        if not tds:
                             continue
-                        
-                        link_key = (text, href)
-                        if link_key not in seen_links:
-                            seen_links.add(link_key)
-                            new_links_found += 1
-                            
-                            parsed = urlparse(href)
-                            params = parse_qs(parsed.query)
-                            
-                            upmid_cd = params.get('upmidCd', [''])[0]
-                            idx_cd = params.get('idxCd', [''])[0]
-                            idx_id = params.get('idxId', [''])[0]
-                            
-                            if idx_cd and idx_id:
-                                indices.append({
-                                    'name': text,
-                                    'href': href,
-                                    'upmidCd': upmid_cd,
-                                    'idxCd': idx_cd,
-                                    'idxId': idx_id,
-                                })
+
+                        # Determine if first td is a category cell or a link cell
+                        first_td_links = tds[0].find_elements(By.CSS_SELECTOR, 'a[href*="MKD03040101.jsp"]')
+
+                        if len(tds) >= 2 and not first_td_links:
+                            # First td is the 구분 category cell; second td has the index link
+                            cat_text = tds[0].text.strip()
+                            if cat_text:
+                                current_category = cat_text
+                            link_elements = tds[1].find_elements(By.CSS_SELECTOR, 'a[href*="MKD03040101.jsp"]')
+                        else:
+                            # Continuation row: no category td (rowspan from above), first td has link
+                            link_elements = first_td_links
+
+                        for link in link_elements:
+                            href = link.get_attribute('href') or ''
+                            text = link.text.strip()
+
+                            if not text:
+                                continue
+
+                            link_key = (text, href)
+                            if link_key not in seen_links:
+                                seen_links.add(link_key)
+                                new_links_found += 1
+
+                                parsed = urlparse(href)
+                                params = parse_qs(parsed.query)
+
+                                upmid_cd = params.get('upmidCd', [''])[0]
+                                idx_cd = params.get('idxCd', [''])[0]
+                                idx_id = params.get('idxId', [''])[0]
+
+                                if idx_cd and idx_id:
+                                    indices.append({
+                                        'name': text,
+                                        'href': href,
+                                        'upmidCd': upmid_cd,
+                                        'idxCd': idx_cd,
+                                        'idxId': idx_id,
+                                        'category': current_category,
+                                    })
                     
                     # Use Selenium 4 Wheel Actions to scroll the table container
                     scroll_origin = ScrollOrigin.from_element(table_container)
@@ -243,32 +271,49 @@ class KRXIndexConstituentsDirect:
             except Exception as scroll_error:
                 # Fallback: if we can't find the scrollable container, use the original method
                 print(f"Could not find scrollable table container ({scroll_error}), using fallback method")
-                
-                # Find all links to index detail pages (non-scrolling fallback)
-                links = driver.find_elements(By.CSS_SELECTOR, 'a[href*="MKD03040101.jsp"]')
 
-                for link in links:
-                    href = link.get_attribute('href') or ''
-                    text = link.text.strip()
+                # Iterate rows to track 구분 category (non-scrolling fallback)
+                current_category = ''
+                rows = driver.find_elements(By.CSS_SELECTOR, 'tr')
 
-                    if not text:
+                for row in rows:
+                    tds = row.find_elements(By.TAG_NAME, 'td')
+                    if not tds:
                         continue
 
-                    parsed = urlparse(href)
-                    params = parse_qs(parsed.query)
+                    first_td_links = tds[0].find_elements(By.CSS_SELECTOR, 'a[href*="MKD03040101.jsp"]')
 
-                    upmid_cd = params.get('upmidCd', [''])[0]
-                    idx_cd = params.get('idxCd', [''])[0]
-                    idx_id = params.get('idxId', [''])[0]
+                    if len(tds) >= 2 and not first_td_links:
+                        cat_text = tds[0].text.strip()
+                        if cat_text:
+                            current_category = cat_text
+                        link_elements = tds[1].find_elements(By.CSS_SELECTOR, 'a[href*="MKD03040101.jsp"]')
+                    else:
+                        link_elements = first_td_links
 
-                    if idx_cd and idx_id:
-                        indices.append({
-                            'name': text,
-                            'href': href,
-                            'upmidCd': upmid_cd,
-                            'idxCd': idx_cd,
-                            'idxId': idx_id,
-                        })
+                    for link in link_elements:
+                        href = link.get_attribute('href') or ''
+                        text = link.text.strip()
+
+                        if not text:
+                            continue
+
+                        parsed = urlparse(href)
+                        params = parse_qs(parsed.query)
+
+                        upmid_cd = params.get('upmidCd', [''])[0]
+                        idx_cd = params.get('idxCd', [''])[0]
+                        idx_id = params.get('idxId', [''])[0]
+
+                        if idx_cd and idx_id:
+                            indices.append({
+                                'name': text,
+                                'href': href,
+                                'upmidCd': upmid_cd,
+                                'idxCd': idx_cd,
+                                'idxId': idx_id,
+                                'category': current_category,
+                            })
 
         except Exception as e:
             print(f"Error during Selenium scraping: {e}")
@@ -545,6 +590,25 @@ class KRXIndexConstituentsDirect:
             conn.commit()
             print(f"   Inserted {len(constituents)} constituents for {date}")
 
+    def save_category_mapping(self, indices: List[Dict], market: str):
+        """Save index_code → category mappings to the index_category_mapping table."""
+        if not indices:
+            return
+
+        with sqlite3.connect(self.db_path) as conn:
+            for index_info in indices:
+                category = index_info.get('category', '')
+                if not category:
+                    continue
+                formatted_name = self.format_index_name(index_info['name'], market)
+                conn.execute(
+                    """INSERT OR REPLACE INTO index_category_mapping (index_code, category, market)
+                       VALUES (?, ?, ?)""",
+                    (formatted_name, category, market.upper())
+                )
+            conn.commit()
+        print(f"   Saved category mappings for {market.upper()}: {len([i for i in indices if i.get('category')])} entries")
+
     def process_date_parallel(self, date: str, market: str = 'kospi', max_workers: int = 4, indices: Optional[List[Dict]] = None) -> bool:
         """
         Process a single date using multiprocessing.
@@ -564,6 +628,7 @@ class KRXIndexConstituentsDirect:
             # Use cached indices if provided, otherwise scrape
             if indices is None:
                 indices = self.scrape_listing_page(market)
+                self.save_category_mapping(indices, market)
             else:
                 print(f"   Using cached indices for {market.upper()}")
             
@@ -627,13 +692,17 @@ class KRXIndexConstituentsDirect:
         print("Optimization: Scraping index listings once per market...")
         kospi_indices = self.scrape_listing_page('kospi')
         kosdaq_indices = self.scrape_listing_page('kosdaq')
-        
+
+        # Save category mappings
+        self.save_category_mapping(kospi_indices, 'kospi')
+        self.save_category_mapping(kosdaq_indices, 'kosdaq')
+
         # Cache the indices for reuse
         self._cached_indices['kospi'] = kospi_indices
         self._cached_indices['kosdaq'] = kosdaq_indices
-        
+
         print(f"Cached {len(kospi_indices)} KOSPI indices and {len(kosdaq_indices)} KOSDAQ indices")
-        
+
         current_date = datetime.strptime(start_date, "%Y-%m-%d")
         end_date = datetime.now()
         
@@ -691,13 +760,17 @@ class KRXIndexConstituentsDirect:
         print("Optimization: Scraping index listings once per market...")
         kospi_indices = self.scrape_listing_page('kospi')
         kosdaq_indices = self.scrape_listing_page('kosdaq')
-        
+
+        # Save category mappings
+        self.save_category_mapping(kospi_indices, 'kospi')
+        self.save_category_mapping(kosdaq_indices, 'kosdaq')
+
         # Cache the indices for reuse
         self._cached_indices['kospi'] = kospi_indices
         self._cached_indices['kosdaq'] = kosdaq_indices
-        
+
         print(f"Cached {len(kospi_indices)} KOSPI indices and {len(kosdaq_indices)} KOSDAQ indices")
-        
+
         # Start from next month
         latest_dt = datetime.strptime(latest_date, "%Y-%m-%d")
         if latest_dt.month == 12:
@@ -756,8 +829,8 @@ class KRXIndexConstituentsDirect:
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(description='KRX Index Constituents Direct Processor')
-    parser.add_argument('--mode', choices=['backfill', 'update'], default='backfill',
-                        help='Processing mode: backfill (historical) or update (from latest)')
+    parser.add_argument('--mode', choices=['backfill', 'update', 'map'], default='backfill',
+                        help='Processing mode: backfill (historical), update (from latest), or map (category mapping only)')
     parser.add_argument('--strategy', choices=['overwrite', 'skip'], default='skip',
                         help='Update strategy: overwrite existing data or skip')
     parser.add_argument('--start-date', default='2010-01-01',
@@ -775,8 +848,14 @@ def main():
     # Run based on mode
     if args.mode == 'backfill':
         processor.backfill(args.start_date, args.workers)
-    else:
+    elif args.mode == 'update':
         processor.update(args.strategy, args.workers)
+    else:  # map
+        print("Scraping category mappings only...")
+        for market in ('kospi', 'kosdaq'):
+            indices = processor.scrape_listing_page(market)
+            processor.save_category_mapping(indices, market)
+        print("Done.")
 
 
 if __name__ == '__main__':

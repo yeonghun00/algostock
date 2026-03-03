@@ -141,16 +141,13 @@ def _print_df_table(
 
 
 def _select_target_col(df: pd.DataFrame, horizon: int) -> str:
-    """Match the backtest's target: cross-sectional z-score of residual return."""
-    fwd_col = f"forward_return_{horizon}d"
-    residual_col = f"target_residual_{horizon}d"
-    zscore_col = f"target_residual_zscore_{horizon}d"
-    base_col = residual_col if residual_col in df.columns else fwd_col
-    if base_col in df.columns and zscore_col not in df.columns:
-        grp = df.groupby("date")[base_col]
-        df[zscore_col] = (df[base_col] - grp.transform("mean")) / grp.transform("std").replace(0, np.nan)
-        df[zscore_col] = df[zscore_col].fillna(0.0)
-    return zscore_col
+    """Match the backtest's target: residual rank → 5 integer levels (0-4) for LambdaRank."""
+    residual_rank_col = f"target_residual_rank_{horizon}d"
+    rank_label_col = f"target_rank_label_{horizon}d"
+    base_col = residual_rank_col if residual_rank_col in df.columns else f"target_rank_{horizon}d"
+    if base_col in df.columns and rank_label_col not in df.columns:
+        df[rank_label_col] = np.clip((df[base_col] * 5).astype(int), 0, 4)
+    return rank_label_col
 
 
 def _retrain_model(
@@ -196,6 +193,45 @@ def _retrain_model(
     return model
 
 
+def _print_feature_group_importance(model) -> None:
+    """Print LightGBM gain-based importance aggregated by feature group."""
+    try:
+        imp_df = model.feature_importance()
+    except Exception as e:
+        print(f"[Feature Importance] Could not compute: {e}")
+        return
+
+    from ml.features.registry import get_feature_group_map
+    group_map = get_feature_group_map()
+
+    imp_df["group"] = imp_df["feature"].map(group_map).fillna("other")
+    group_imp = imp_df.groupby("group")["importance"].sum().sort_values(ascending=False)
+    total = group_imp.sum()
+
+    # Also collect top-3 features per group
+    top_features = (
+        imp_df.sort_values("importance", ascending=False)
+        .groupby("group")
+        .head(3)
+        .groupby("group")["feature"]
+        .apply(list)
+    )
+
+    print("\n" + "=" * 60)
+    print("  Feature Group Importance (Gain-based)")
+    print("=" * 60)
+    bar_scale = 40
+    for grp, imp in group_imp.items():
+        pct = imp / total * 100 if total > 0 else 0.0
+        bar = "█" * int(pct / 100 * bar_scale)
+        feats = ", ".join(top_features.get(grp, [])[:3])
+        print(f"  {grp:<22} {pct:>5.1f}%  {bar}")
+        if feats:
+            print(f"  {'':22}        top: {feats}")
+    print("=" * 60)
+    print(f"  Total features: {len(imp_df)}\n")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Get latest picks from unified model")
     parser.add_argument("--model", default="lgbm", choices=["lgbm", "xgboost", "catboost"],
@@ -206,6 +242,7 @@ def main() -> None:
     parser.add_argument("--top", type=int, default=20)
     parser.add_argument("--bottom", type=int, default=10)
     parser.add_argument("--min-market-cap", type=int, default=500_000_000_000)
+    parser.add_argument("--max-market-cap", type=int, default=None, help="Maximum market cap (e.g. 5000000000000 for SMID-cap)")
     parser.add_argument("--model-path", default="models/lgbm_unified.pkl",
                         help="Path to pre-trained model from backtest")
     parser.add_argument("--retrain", action="store_true",
@@ -225,7 +262,11 @@ def main() -> None:
                         help="How to render picks in terminal")
     parser.add_argument("--view", choices=["compact", "full"], default="full",
                         help="Column set for terminal display")
+    parser.add_argument("--target-return", type=float, default=0.05,
+                        help="매도가 = 매수가 × (1 + target_return). Default: 0.05 (5%%)")
     parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument("--feature-importance", action="store_true",
+                        help="Print feature group importance (gain) after loading model")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.WARNING)
@@ -245,7 +286,45 @@ def main() -> None:
         model = BaseRanker.load(str(model_file))
         feature_cols = model.feature_cols
         print(f"Model target: {model.target_col}, features: {len(feature_cols)}")
+
+        # Sync all backtest config from model metadata
+        meta = model.metadata
+        if meta:
+            # market cap — only override if user left the default sentinel
+            if "min_market_cap" in meta and args.min_market_cap == 500_000_000_000:
+                args.min_market_cap = meta["min_market_cap"]
+            if "max_market_cap" in meta and getattr(args, "max_market_cap", None) is None:
+                args.max_market_cap = meta["max_market_cap"]
+            # top_n — only override if user left the default (20)
+            if "top_n" in meta and args.top == 20:
+                args.top = meta["top_n"]
+            # sector neutral score
+            if "sector_neutral_score" in meta:
+                args._sector_neutral_score = meta["sector_neutral_score"]
+            else:
+                args._sector_neutral_score = True  # backtest default
+            # liquidity
+            if "min_daily_value" in meta and not hasattr(args, "_min_daily_value"):
+                args._min_daily_value = meta["min_daily_value"]
+            else:
+                args._min_daily_value = getattr(args, "_min_daily_value", 0)
+            print(
+                f"[Model metadata] "
+                f"min_market_cap={args.min_market_cap:,}  "
+                f"max_market_cap={args.max_market_cap}  "
+                f"top_n={args.top}  "
+                f"sector_neutral={args._sector_neutral_score}  "
+                f"min_daily_value={args._min_daily_value}  "
+                f"horizon={meta.get('horizon', '?')}  "
+                f"backtest_end={meta.get('backtest_end', '?')}"
+            )
+        else:
+            # No metadata (old model) — use safe defaults matching backtest
+            args._sector_neutral_score = True
+            args._min_daily_value = 0
     elif args.retrain:
+        args._sector_neutral_score = True   # backtest default
+        args._min_daily_value = 0
         print("Retraining model...")
         train_df = fe.prepare_ml_data(
             start_date=args.train_start,
@@ -277,11 +356,16 @@ def main() -> None:
         print(f"No model found at {model_file}. Run backtest first or use --retrain.")
         return
 
+    # --- Feature group importance ---
+    if args.feature_importance:
+        _print_feature_group_importance(model)
+
     # --- Build prediction features for the latest date (no forward return needed) ---
     pred_df = fe.prepare_prediction_data(
         end_date=end_date,
         target_horizon=args.horizon,
         min_market_cap=args.min_market_cap,
+        max_market_cap=getattr(args, "max_market_cap", None),
     )
     if pred_df.empty:
         print("No prediction data available.")
@@ -293,8 +377,41 @@ def main() -> None:
         print(f"Warning: {len(missing_features)} model features missing from prediction data: {missing_features[:5]}")
         feature_cols = [c for c in feature_cols if c in pred_df.columns]
 
+    # ── Filters matching backtest universe construction ───────────────────
+    # 1. Exclude suspended stocks (거래정지: value == 0)
+    if "value" in pred_df.columns:
+        suspended_before = len(pred_df)
+        pred_df = pred_df[pred_df["value"] > 0].copy()
+        suspended = suspended_before - len(pred_df)
+        if suspended:
+            print(f"[Filter] Removed {suspended} suspended stocks (value=0)")
+
+    # 2. Minimum daily trading value (liquidity filter)
+    _min_dv = getattr(args, "_min_daily_value", 0)
+    if _min_dv > 0 and "value" in pred_df.columns:
+        before = len(pred_df)
+        pred_df = pred_df[pred_df["value"] >= _min_dv].copy()
+        print(f"[Filter] min_daily_value={_min_dv:,} removed {before - len(pred_df)} stocks")
+
+    # ── Scoring ──────────────────────────────────────────────────────────
     pred_df["score"] = model.predict(pred_df)
-    pred_df["rank"] = pred_df["score"].rank(ascending=False, method="first").astype(int)
+
+    # Sector-neutral score (replicates backtest --sector-neutral-score)
+    _sn = getattr(args, "_sector_neutral_score", True)
+    if _sn and "sector" in pred_df.columns:
+        sec_mean = pred_df.groupby("sector")["score"].transform("mean")
+        sec_std  = pred_df.groupby("sector")["score"].transform("std").replace(0, np.nan)
+        pred_df["score_rank"] = (
+            (pred_df["score"] - sec_mean) / sec_std
+        ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    else:
+        pred_df["score_rank"] = pred_df["score"]
+
+    pred_df["rank"] = pred_df["score_rank"].rank(ascending=False, method="first").astype(int)
+
+    # 매수가 / 매도가
+    pred_df["매수가"] = pred_df["closing_price"].round(0).astype(int)
+    pred_df["매도가"] = (pred_df["closing_price"] * (1 + args.target_return)).round(0).astype(int)
 
     latest_date = pred_df["date"].max()
 
@@ -303,9 +420,12 @@ def main() -> None:
         "stock_code",
         "name",
         "sector",
+        "매수가",
+        "매도가",
         "closing_price",
         "market_cap",
         "score",
+        "score_rank",
         "roe",
         "mom_21d",
     ]
@@ -314,9 +434,12 @@ def main() -> None:
         "stock_code",
         "name",
         "sector",
+        "매수가",
+        "매도가",
         "closing_price",
         "market_cap",
         "score",
+        "score_rank",
         "roe",
         "gpa",
         "mom_21d",
@@ -345,7 +468,7 @@ def main() -> None:
         _print_df_table("Avoid Picks", avoids, decimals=args.display_decimals, max_columns=args.max_columns)
 
     out_file = Path(f"picks_unified_{latest_date}.csv")
-    pred_df[export_cols].sort_values("rank").to_csv(out_file, index=False)
+    pred_df[export_cols].sort_values("rank").to_csv(out_file, index=False, encoding="utf-8-sig")
     print(f"\nSaved ranking to {out_file}")
 
 

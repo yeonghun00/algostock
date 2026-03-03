@@ -1,0 +1,9 @@
+﻿metric,value,p_value,note
+OLS t-stat,4.289116223973477,3.944986576406442e-05,
+Newey-West t-stat,4.603898192646387,1.1470778648934179e-05,lags=5
+Sharpe t-stat (Lo02),4.289116223973477,3.944986576406442e-05,
+IC t-stat,11.505401694992164,2.0095281004858116e-20,n=108
+Bootstrap Sharpe CI lo,0.8380807533044682,,
+Bootstrap Sharpe CI hi,2.751471917430402,,
+Binomial hit-rate p,65,0.02140361039961279,65/108
+VERDICT,STRONG  ✅,,All major tests significant at 1%. Alpha is likely real.

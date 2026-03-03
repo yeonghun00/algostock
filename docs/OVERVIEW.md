@@ -1,130 +1,207 @@
 # AlgoStock Overview
 
-A quantitative stock-picking system for Korean equities (KOSPI/KOSDAQ). It pulls market data from KRX, engineers ~30 features, trains a LightGBM ranking model via walk-forward validation, and outputs ranked stock picks.
+A quantitative stock-picking system for Korean equities (KOSPI/KOSDAQ). Pulls market data from KRX, engineers 87 features across 10 groups, trains a LightGBM ranking model via walk-forward validation, and outputs ranked stock picks for live rebalancing.
 
 ## Architecture
 
 ```
-KRX APIs / Raw Files
+KRX APIs / Raw Financial ZIPs
         |
    ETL Pipelines  ──►  krx_stock_data.db (SQLite)
         |
-  Feature Engineering  (ml/features.py)
+  ml/features/_pipeline.py   (data loading + merging)
         |
-  LightGBM Ranker      (ml/model.py)
+  ml/features/registry.py    (10 feature groups, @register pattern)
         |
-   ┌────┴────┐
-Backtest     Picks
-(scripts/    (scripts/
-run_backtest get_picks
-.py)         .py)
+  ml/models/lgbm.py          (LightGBM Huber ranker, default)
+  ml/models/xgboost.py       (XGBoost alternative)
+  ml/models/catboost.py      (CatBoost alternative)
+        |
+   ┌────┴──────────┐
+Backtest           Live
+scripts/           scripts/
+run_backtest.py    run_live.py
+   |                   |
+runs/<name>/       Kiwoom REST API
+  results.csv       (orders)
+  picks.csv
+  model.pkl
 ```
 
 ## Directory Structure
 
 ```
 algostock/
-├── etl/                  # Data ingestion pipelines
+├── etl/                          # Data ingestion
+│   ├── krx_api.py                # KRX API client
 │   ├── clean_etl.py              # Prices + stock master
 │   ├── index_constituents_etl.py # Index membership snapshots
 │   ├── delisted_stocks_etl.py    # Delisted stock list
-│   └── financial_etl.py          # Financial statements (BS/PL/CF)
-├── ml/                   # ML pipeline
-│   ├── features.py               # Feature engineering (FeatureEngineer)
-│   ├── model.py                  # LightGBM wrapper (MLRanker)
-│   └── backtest.py               # Legacy backtester (unused by main scripts)
-├── scripts/              # Entry points
-│   ├── run_backtest.py           # Train + backtest + save model
-│   └── get_picks.py              # Generate today's picks from trained model
-├── models/               # Saved model artifacts
-│   └── lgbm_unified.pkl
-├── data/
-│   └── raw_financial/            # Raw financial statement ZIPs
-├── docs/                 # You are here
-└── krx_stock_data.db     # SQLite database (all market data)
+│   ├── adj_price_etl.py          # Adjusted price chain
+│   └── financial_etl.py          # IFRS financial statements
+├── ml/
+│   ├── features/                 # 10 feature groups (registry pattern)
+│   │   ├── registry.py           # FeatureGroup base + @register
+│   │   ├── _pipeline.py          # DB loading, merging, orchestration
+│   │   ├── momentum.py
+│   │   ├── momentum_academic.py
+│   │   ├── volume.py
+│   │   ├── volatility.py
+│   │   ├── fundamental.py
+│   │   ├── market.py
+│   │   ├── sector.py
+│   │   ├── sector_neutral.py
+│   │   ├── sector_rotation.py
+│   │   ├── distress.py
+│   │   └── macro_interaction.py
+│   └── models/
+│       ├── base.py               # BaseRanker (save/load/predict)
+│       ├── lgbm.py               # LGBMRanker (default)
+│       ├── xgboost.py
+│       └── catboost.py
+├── scripts/
+│   ├── run_backtest.py           # Walk-forward backtest + model save
+│   ├── get_picks.py              # Today's picks from saved model
+│   ├── run_live.py               # Rebalance schedule + Kiwoom orders
+│   ├── run_etl.py                # Unified ETL runner
+│   ├── algostock_cli.py          # CLI interface
+│   ├── dashboard.py              # HTML dashboard
+│   ├── auto_live.sh              # Daily cron/launchd wrapper
+│   └── setup_scheduler.sh        # Scheduler install/remove
+├── verification/
+│   ├── verify_backtest.py        # Independent result cross-check
+│   └── README.md
+├── runs/                         # One folder per backtest run
+│   └── <run_name>/
+│       ├── results.csv
+│       ├── picks.csv
+│       ├── model.pkl
+│       ├── report.png
+│       ├── rolling_sharpe.csv
+│       ├── quintiles.csv
+│       ├── sector_attribution.csv
+│       └── stat_significance.csv
+├── live/
+│   ├── state.json                # Current holdings + last rebal
+│   ├── logs/                     # Daily execution logs
+│   └── orders/                   # Per-date order JSON logs
+└── krx_stock_data.db
 ```
 
 ## End-to-End Workflow
 
-### Step 1: Refresh Data (ETL)
-
-Run in this order. Each pipeline is independent but later ones assume prices exist.
+### Step 1: ETL — Refresh Data
 
 ```bash
-# 1. Prices + stock master (takes longest)
-python3 etl/clean_etl.py --daily-update --date 20260214 --markets kospi,kosdaq
-
-# 2. Index constituents
-python3 etl/index_constituents_etl.py --mode update --strategy skip --workers 4 --config config.json
-
-# 3. Delisted stocks
-python3 etl/delisted_stocks_etl.py
-
-# 4. Financial statements
-python3 etl/financial_etl.py krx_stock_data.db data/raw_financial
+python3 scripts/run_etl.py update --markets kospi,kosdaq --workers 4
 ```
 
-See [ETL.md](ETL.md) for full details and backfill commands.
+Or via CLI:
 
-### Step 2: Train Model + Backtest
+```bash
+python3 scripts/algostock_cli.py update-all
+```
+
+For full historical backfill:
+
+```bash
+python3 scripts/run_etl.py backfill --start-date 20100101 --end-date 20251231
+```
+
+See [ETL.md](ETL.md) for pipeline details, DB schema, and individual pipeline commands.
+
+### Step 2: Train + Backtest
 
 ```bash
 python3 scripts/run_backtest.py \
-  --start 20100101 --end 20251231 \
-  --workers 4 --no-cache
+  --start 20100101 --end 20260101 \
+  --horizon 42 --top-n 20 \
+  --train-years 3 \
+  --min-market-cap 100000000000 --max-market-cap 1000000000000 \
+  --buy-rank 10 --hold-rank 120 \
+  --buy-fee 0.05 --sell-fee 0.25 \
+  --patience 100 --no-cache \
+  --output myrun --save-picks
 ```
 
-This does everything: builds features, runs walk-forward train/test splits, simulates portfolio rebalancing with transaction costs, saves the trained model to `models/lgbm_unified.pkl`, and writes result CSVs.
+Builds features, runs walk-forward folds, simulates portfolio with transaction costs, saves model to `runs/myrun/model.pkl`.
 
-See [MODEL.md](MODEL.md) for backtest mechanics, features, and all CLI flags.
+See [MODEL.md](MODEL.md) for all CLI flags, feature group reference, and model params.
 
-### Step 3: Generate Picks
+### Step 3: Get Picks (manual)
 
 ```bash
-python3 scripts/get_picks.py \
-  --start 20220101 --end 20260214 \
-  --top 20 --bottom 10
+python3 scripts/get_picks.py --model-path runs/myrun/model.pkl --top 20
 ```
 
-Outputs a ranked list of top picks (buy) and bottom picks (avoid) for the latest date in the data. Also saves a full ranking CSV.
+Scores today's universe with the saved model, prints ranked picks and avoid list, saves `picks_unified_YYYYMMDD.csv`.
+
+### Step 4: Live Rebalancing
+
+```bash
+# Check schedule (dry-run)
+python3 scripts/run_live.py --run myrun
+
+# Execute orders on rebalance day
+python3 scripts/run_live.py --run myrun --execute
+```
+
+Logic:
+- Runs ETL update first
+- Reads last rebalance date from `runs/myrun/results.csv`
+- Computes next execution date = last_rebal + horizon + 1 trading day
+- If today: places sell → buy orders via Kiwoom REST API
+- Saves state to `live/state.json` and order log to `live/orders/YYYYMMDD.json`
+
+### Step 5: Automate
+
+```bash
+# Install daily launchd scheduler (07:30 local time by default)
+./scripts/setup_scheduler.sh start --run myrun --hour 7 --min 30
+
+# Also wake Mac from sleep 5 min before
+sudo pmset repeat wakeorpoweron MTWRF 07:25:00
+
+# Check scheduler status
+./scripts/setup_scheduler.sh status
+
+# Stop
+./scripts/setup_scheduler.sh stop
+sudo pmset repeat cancel
+```
 
 ## Key Design Principles
 
-**Point-in-time (PIT) safety** -- Financial data is only used after its `available_date` (45/90-day rule). Index membership is matched by month. Delisted stocks are excluded before their delist date. No future information leaks into training or evaluation.
+**Point-in-time (PIT) safety** — Financial data only used after its `available_date` (45/90-day rule). No future information leaks into training or evaluation. See [BIAS.md](BIAS.md).
 
-**Walk-forward validation** -- The model is never tested on data it trained on. Training uses a rolling N-year window, and testing is always the next calendar year.
+**Walk-forward validation** — Model never tested on training data. Rolling N-year training window, tested on the next calendar year. 43-day embargo between train and test.
 
-**Transaction-cost-aware** -- Backtest applies buy/sell fees on every rebalance. Hysteresis rules reduce unnecessary turnover. Stress mode doubles fees for conservative estimates.
+**Transaction-cost-aware** — Buy/sell fees on every rebalance. Hysteresis (buy-rank / hold-rank) reduces unnecessary turnover.
 
-**Sector-aware** -- Features include sector-relative momentum, sector z-scores, sector breadth, and rotation signals. Scoring can optionally be sector-neutralized.
+**Sector-aware** — Sector z-scores, sector relative momentum, breadth, rotation signals. Scoring sector-neutralized by default.
+
+**Survivorship-bias-free** — Delisted stocks included in universe up to their delisting date.
 
 ## Output Files
 
 | File | Description |
 |------|-------------|
-| `backtest_unified_results.csv` | Per-rebalance returns, alpha, IC, quintile stats |
-| `*_rolling_sharpe.csv` | Rolling 12-period Sharpe ratio |
-| `*_quintiles.csv` | Average return by model-score quintile (Q1-Q5) |
-| `*_sector_attribution.csv` | Sector weight and contribution per rebalance |
-| `models/lgbm_unified.pkl` | Trained LightGBM model (pickle) |
-| `picks_unified_YYYYMMDD.csv` | Full stock ranking for the latest date |
+| `runs/<name>/results.csv` | Per-rebalance returns, alpha, IC, benchmark |
+| `runs/<name>/picks.csv` | All stock picks with scores and forward returns |
+| `runs/<name>/model.pkl` | Trained model artifact (LightGBM) |
+| `runs/<name>/report.png` | Visual backtest report |
+| `runs/<name>/rolling_sharpe.csv` | Rolling Sharpe over time |
+| `runs/<name>/quintiles.csv` | Q1–Q5 average returns |
+| `runs/<name>/sector_attribution.csv` | Sector contribution breakdown |
+| `runs/<name>/stat_significance.csv` | t-stats, bootstrap CI, IC t-stat |
+| `live/state.json` | Current holdings + last executed rebalance date |
+| `live/logs/YYYYMMDD.log` | Full daily execution log |
 
 ## Key Metrics to Watch
 
-- **Mean IC (Spearman)**: Rank correlation between model scores and actual forward returns. > 0.03 is decent.
-- **Quintile monotonicity**: Q5 mean return should be > Q4 > Q3 > Q2 > Q1. If not, the model's ranking power is broken.
-- **Average turnover**: Lower is better after fees. Hysteresis helps here.
-- **Max drawdown / underwater duration**: How bad it gets and how long recovery takes.
-- **Sharpe / Calmar**: Risk-adjusted performance ratios.
-
-## Quick Validation Commands
-
-```bash
-# Check DB tables exist
-sqlite3 krx_stock_data.db "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;"
-
-# Check data freshness
-sqlite3 krx_stock_data.db "SELECT MAX(date) FROM daily_prices;"
-sqlite3 krx_stock_data.db "SELECT MAX(date) FROM index_constituents;"
-sqlite3 krx_stock_data.db "SELECT COUNT(*) FROM financial_periods;"
-```
+- **Mean IC**: Rank correlation between model scores and forward returns. 0.12+ is strong.
+- **IC IR**: IC / std(IC). > 1.5 is very good.
+- **Quintile monotonicity**: Q5 return > Q4 > Q3 > Q2 > Q1. If not, model ranking is broken.
+- **Down capture**: < 0.7 is good defense. 0.07 means near-independent from market drops.
+- **Beta**: < 0.5 means returns are largely alpha-driven, not market-beta.
+- **Sharpe t-stat**: > 2.0 (5% significance). Prefer Newey-West HAC version.

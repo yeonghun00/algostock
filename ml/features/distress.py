@@ -11,13 +11,7 @@ from .registry import FeatureGroup, register
 @register
 class DistressFeatures(FeatureGroup):
     name = "distress"
-    columns = [
-        "liquidity_decay_score",
-        "low_price_trap",
-        "is_liquidity_distressed",
-        "is_low_price_trap",
-        "distress_composite_score",
-    ]
+    columns = ["distress_composite_score", "liquidity_decay_score", "low_price_trap"]
     dependencies = ["closing_price"]
 
     def compute(self, df: pd.DataFrame) -> pd.DataFrame:

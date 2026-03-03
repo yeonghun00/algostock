@@ -30,6 +30,7 @@ class BaseRanker(ABC):
         self.time_decay = time_decay
         self.patience = patience
         self.model = None
+        self.metadata: Dict = {}  # arbitrary backtest config (market_cap, horizon, etc.)
         self.logger = logging.getLogger(self.__class__.__name__)
 
     def _calculate_time_weights(self, df: pd.DataFrame) -> Optional[np.ndarray]:
@@ -84,6 +85,7 @@ class BaseRanker(ABC):
             "time_decay": self.time_decay,
             "saved_at": datetime.now().isoformat(),
             "version": "unified_v2",
+            "metadata": self.metadata,
         }
         with out_path.open("wb") as f:
             pickle.dump(payload, f)
@@ -106,4 +108,5 @@ class BaseRanker(ABC):
             time_decay=payload.get("time_decay", 0.0),
         )
         ranker.model = payload["model"]
+        ranker.metadata = payload.get("metadata", {})
         return ranker
